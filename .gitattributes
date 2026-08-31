@@ -1,0 +1,14 @@
+* text=auto eol=crlf
+*.bat text eol=crlf
+*.ini text eol=crlf
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.7z binary
+*.bin binary
+*.ckpt binary
+*.exe binary
+*.gguf binary
+*.msi binary
+*.pth binary
+*.safetensors binary
+*.zip binary

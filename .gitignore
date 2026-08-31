@@ -1,0 +1,60 @@
+# Runtime and downloaded content
+/Logs/
+/Models/
+/Reports/
+/Runtime/
+/Temp/
+# Generated deployment state
+/Data/Checkpoints/
+/Data/Configs/managed-payload.json
+/Data/config.json
+/Data/engine.lock
+/Data/hardware.json
+/Data/health.json
+/Data/install-ownership.json
+/Data/model-plan.json
+/Data/ollama.runtime.json
+/Data/openui-config.sha256
+/Data/platform-validation.json
+/Data/reboot-required.json
+/Data/runtime-controller.json
+/Data/state.json
+/Data/tts.runtime.json
+/Data/validation.json
+# Model weights and installers
+*.7z
+*.bin
+*.ckpt
+*.exe
+*.gguf
+*.msi
+*.pth
+*.safetensors
+*.tar.gz
+*.zip
+# Temporary files and caches
+*.copy
+*.download
+*.log
+*.py[cod]
+*.tmp
+.pytest_cache/
+.venv/
+.winlama-backup-*/
+.winlama-stage-*/
+__pycache__/
+venv/
+# Portable third-party distributions
+/ComfyUI-WanVideoWrapper-*/
+/ComfyUI_windows_portable_*/
+# Editors and operating systems
+.agents/
+.codex/
+.DS_Store
+.idea/
+.vs/
+.vscode/
+*.suo
+*.user
+Desktop.ini
+Thumbs.db

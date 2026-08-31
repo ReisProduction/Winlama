@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="60">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{PAGE_TITLE}}</title>
+  <style>
+    :root{color-scheme:dark;--bg:#08111f;--panel:#111c2e;--line:#26354d;--text:#e7edf7;--muted:#93a4bb;--ok:#36d399;--bad:#fb7185;--warn:#fbbf24}
+    *{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#07101d,#101b2d);font:14px/1.5 system-ui,sans-serif;color:var(--text)}
+    main{max-width:1180px;margin:auto;padding:32px 20px}header{display:flex;justify-content:space-between;gap:24px;align-items:end;margin-bottom:24px}h1,h2{margin:0}h1{font-size:28px}h2{font-size:16px;margin-bottom:14px}.muted{color:var(--muted)}
+    .badge{padding:7px 12px;border-radius:999px;font-weight:700}.SUCCESS,.RUNNING{background:#123e35;color:var(--ok)}.FAILED{background:#4b1c28;color:var(--bad)}.RECOVERING,.ROLLBACK{background:#493717;color:var(--warn)}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.panel{background:rgba(17,28,46,.95);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 14px 30px #0004}.wide{grid-column:1/-1}.value{font-size:24px;font-weight:750;margin-top:4px}
+    table{width:100%;border-collapse:collapse}th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--muted);font-weight:600}a{color:#67e8f9;text-decoration:none}a:hover{text-decoration:underline}.ok{color:var(--ok)}.bad{color:var(--bad)}pre{white-space:pre-wrap;word-break:break-word;margin:0;color:#c9d5e7;max-height:340px;overflow:auto}
+    @media(max-width:760px){.grid{grid-template-columns:1fr}header{align-items:start;flex-direction:column}.wide{grid-column:auto}}
+  </style>
+</head>
+<body>
+<main>
+  <header><div><h1>{{SUMMARY_TITLE}}</h1><div class="muted">v{{ENGINE_VERSION}} - {{GENERATED_AT}}</div></div><span class="badge {{STATUS_CLASS}}">{{STATUS}}</span></header>
+  <section class="grid">
+    <article class="panel"><div class="muted">{{MACHINE_TITLE}}</div><div class="value">{{MACHINE}}</div></article>
+    <article class="panel"><div class="muted">{{MODEL_TITLE}}</div><div class="value">{{MODELS}}</div></article>
+    <article class="panel"><div class="muted">{{INFERENCE_TITLE}}</div><div class="value">{{LATENCY}}</div></article>
+    <article class="panel wide"><h2>{{ENDPOINTS_TITLE}}</h2>{{ENDPOINTS}}</article>
+    <article class="panel wide"><h2>{{STAGES_TITLE}}</h2>{{STAGES}}</article>
+    <article class="panel"><h2>{{HARDWARE_TITLE}}</h2>{{HARDWARE}}</article>
+    <article class="panel"><h2>{{HEALTH_TITLE}}</h2>{{HEALTH}}</article>
+    <article class="panel"><h2>{{VALIDATION_TITLE}}</h2>{{VALIDATION}}</article>
+    <article class="panel wide"><h2>{{LOGS_TITLE}}</h2><pre>{{LOGS}}</pre></article>
+  </section>
+</main>
+</body>
+</html>
