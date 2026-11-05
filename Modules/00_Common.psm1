@@ -571,6 +571,11 @@ function Test-DeploymentConfiguration {
             'c71de0fe7204c83f1c10820a7d696d0b450048ba'
         )
     }
+    $bilingual = $Config.Voice.PSObject.Properties['Bilingual']
+    if ($null -ne $bilingual -and $bilingual.Value -isnot [bool]) {
+        throw (Get-LocalizedText -Key 'Common.Error.ConfigFieldInvalid' `
+            -Arguments @('Voice.Bilingual'))
+    }
     $voiceLanguage = [string]$Config.Voice.Language
     $voiceProfile = $voiceProfiles[$voiceLanguage]
     if ($Config.Voice.Host -notin @(
@@ -1265,6 +1270,13 @@ function Get-ApplicationOperationalPayloadFiles {
             'default_workflow.js'),
         'Modules\Dashboard\template.html',
         'Modules\Localization\LocalizationManager.psm1',
+        'Modules\Repair\DiskScope.ps1',
+        'Modules\Engine\Transcript.ps1',
+        'Modules\Launcher\ChildDiagnostics.ps1',
+        'Modules\ModelManager\Menu.ps1',
+        'Modules\Uninstall\Menu.ps1',
+        'Modules\Installer\Voice.ps1',
+        'Modules\Startup\Controller.ps1',
         'Modules\UI\ComfyUI.ps1',
         'Modules\UI\ConsoleUI.psm1',
         'Modules\UI\OpenWebUI.ps1',
@@ -1310,9 +1322,9 @@ function Assert-ApplicationSourcePayload {
     }
     $prefix = $root + [IO.Path]::DirectorySeparatorChar
     $required = @(Get-ApplicationOperationalPayloadFiles)
-    if ($required.Count -ne 36) {
+    if ($required.Count -ne 43) {
         throw [IO.InvalidDataException]::new(
-            'Operasyonel payload dosya sayisi 36 olmali.'
+            'Operasyonel payload dosya sayisi 43 olmali.'
         )
     }
     foreach ($relativePath in $required) {
@@ -1540,8 +1552,8 @@ function Assert-ApplicationPayloadContracts {
         )
     }
     $operationalFiles = @(Get-ApplicationOperationalPayloadFiles)
-    if ($operationalFiles.Count -ne 36 -or
-        @($operationalFiles | Sort-Object -Unique).Count -ne 36 -or
+    if ($operationalFiles.Count -ne 43 -or
+        @($operationalFiles | Sort-Object -Unique).Count -ne 43 -or
         $operationalFiles -inotcontains 'Data\Configs\config.json' -or
         'README.md' -iin $operationalFiles -or
         'LICENSE' -iin $operationalFiles) {
@@ -1600,12 +1612,12 @@ function Assert-ApplicationPayloadContracts {
         '-File C:\Winlama\Start.ps1 ' +
         '-ConfigPath C:\Winlama\Data\Configs\config.json ' +
         '-OllamaMode Keep -OpenWebUIMode Skip ' +
-        '-VoiceMode Restart -ComfyUIMode Skip'
+        '-VoiceMode Keep -ComfyUIMode Skip -NoPause'
     $expectedSpaced = '-NoLogo -NoProfile -ExecutionPolicy Bypass ' +
         '-File "C:\Program Files\Winlama\Start.ps1" ' +
         '-ConfigPath "C:\Winlama Data\config.json" ' +
-        '-OllamaMode Skip -OpenWebUIMode Restart ' +
-        '-VoiceMode Skip -ComfyUIMode Restart'
+        '-OllamaMode Skip -OpenWebUIMode Keep ' +
+        '-VoiceMode Skip -ComfyUIMode Keep -NoPause'
     if ($unspacedShortcut -cne $expectedUnspaced -or
         $spacedShortcut -cne $expectedSpaced) {
         throw [IO.InvalidDataException]::new(
@@ -1629,10 +1641,10 @@ function Assert-ApplicationPayloadContracts {
     }
     Write-Verbose 'WINLAMA_VALIDATION_OK:Config.InstallSource'
     $expectedConfig = [pscustomobject][ordered]@{
-        EngineVersion = '26.8.6'
+        EngineVersion = '26.10.29'
         Installation = [pscustomobject][ordered]@{
             Installed = $true
-            EngineVersion = '26.8.6'
+            EngineVersion = '26.10.29'
             InstalledAt = $dateText
         }
     }
@@ -1640,17 +1652,17 @@ function Assert-ApplicationPayloadContracts {
         ConvertTo-StableJson -Value $expectedConfig -Depth 10
     )
     $missingInstallation = [pscustomobject]@{
-        EngineVersion = '26.8.6'
+        EngineVersion = '26.10.29'
     }
     $nullInstallation = [pscustomobject]@{
-        EngineVersion = '26.8.6'
+        EngineVersion = '26.10.29'
         Installation = $null
     }
     $stringInstalled = [pscustomobject]@{
-        EngineVersion = '26.8.6'
+        EngineVersion = '26.10.29'
         Installation = [pscustomobject]@{
             Installed = 'true'
-            EngineVersion = '26.8.6'
+            EngineVersion = '26.10.29'
         }
     }
     $badIdentity = ConvertFrom-WinlamaJson -Json (
@@ -1875,9 +1887,9 @@ function ConvertTo-WinlamaStartupShortcutArguments {
         [Parameter(Mandatory)][bool]$ComfyUIEnabled
     )
     $ollamaMode = if ($OllamaEnabled) { 'Keep' } else { 'Skip' }
-    $openWebUIMode = if ($OpenWebUIEnabled) { 'Restart' } else { 'Skip' }
-    $voiceMode = if ($VoiceEnabled) { 'Restart' } else { 'Skip' }
-    $comfyUIMode = if ($ComfyUIEnabled) { 'Restart' } else { 'Skip' }
+    $openWebUIMode = if ($OpenWebUIEnabled) { 'Keep' } else { 'Skip' }
+    $voiceMode = if ($VoiceEnabled) { 'Keep' } else { 'Skip' }
+    $comfyUIMode = if ($ComfyUIEnabled) { 'Keep' } else { 'Skip' }
     $quotedScriptPath = ConvertTo-WindowsCommandLineArgument `
         -Argument $ScriptPath
     $quotedConfigPath = ConvertTo-WindowsCommandLineArgument `
@@ -1885,7 +1897,7 @@ function ConvertTo-WinlamaStartupShortcutArguments {
     $template = '-NoLogo -NoProfile -ExecutionPolicy Bypass ' +
         '-File {0} -ConfigPath {1} ' +
         '-OllamaMode {2} -OpenWebUIMode {3} ' +
-        '-VoiceMode {4} -ComfyUIMode {5}'
+        '-VoiceMode {4} -ComfyUIMode {5} -NoPause'
     return $template -f `
         $quotedScriptPath, $quotedConfigPath, $ollamaMode,
         $openWebUIMode, $voiceMode, $comfyUIMode
@@ -2151,6 +2163,18 @@ function Test-TcpEndpoint {
     finally {
         $client.Dispose()
     }
+}
+function Save-WinlamaWebFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][uri]$Uri,
+        [Parameter(Mandatory)][string]$OutFile,
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [hashtable]$Headers = @{}
+    )
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -Headers $Headers `
+        -UseBasicParsing -TimeoutSec $TimeoutSec
 }
 function Test-HttpEndpoint {
     [CmdletBinding()]
@@ -2469,7 +2493,7 @@ Export-ModuleMember -Function @(
     'Test-WinlamaStartupShortcut',
     'Test-ApplicationPayload',
     'Unregister-DeploymentResumeTask', 'Test-TcpEndpoint',
-    'Test-HttpEndpoint', 'Get-LocalHttpOrigins',
+    'Save-WinlamaWebFile', 'Test-HttpEndpoint', 'Get-LocalHttpOrigins',
     'Set-WinlamaProcessPriority', 'Get-WinlamaLanHost',
     'Get-WinlamaServiceUris',
     'Get-ModelStorageRequirement',

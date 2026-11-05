@@ -163,8 +163,17 @@ function Test-HardwareResourcePolicy {
         [pscustomobject]$Hardware
     )
     $policy = Get-HardwareResourcePolicy -Config $Config
-    return [double]$Hardware.RamGB -ge $policy.MinimumRamGB -and
+    $ramCapacityGB = Get-HardwareRamCapacity -Hardware $Hardware
+    return $ramCapacityGB -ge $policy.MinimumRamGB -and
         [double]$Hardware.FreeDiskGB -ge $policy.MinimumFreeDiskGB
+}
+function Get-HardwareRamCapacity {
+    param([pscustomobject]$Hardware)
+    $installed = $Hardware.PSObject.Properties['InstalledRamGB']
+    if ($null -ne $installed -and [double]$installed.Value -gt 0) {
+        return [double]$installed.Value
+    }
+    return [double]$Hardware.RamGB
 }
 function Get-HardwareInventory {
     [CmdletBinding()]
@@ -205,6 +214,14 @@ function Get-HardwareInventory {
         -NvidiaDetected $nvidiaDetected `
         -NvidiaSmiReady ($null -ne $nvidiaSmi)
     $ramGB = [math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
+    $installedRam = Get-CimInstance -ClassName Win32_PhysicalMemory `
+        -ErrorAction SilentlyContinue | Measure-Object -Property Capacity -Sum
+    $installedRamGB = if ($null -ne $installedRam -and $installedRam.Sum -gt 0) {
+        [math]::Round($installedRam.Sum / 1GB, 2)
+    }
+    else {
+        $ramGB
+    }
     $freeDiskGB = [math]::Round($disk.FreeSpace / 1GB, 2)
     $chassis = @(Get-CimInstance -ClassName Win32_SystemEnclosure)
     $portableTypes = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
@@ -221,6 +238,7 @@ function Get-HardwareInventory {
             LogicalCores = [int]$processor.NumberOfLogicalProcessors
         }
         RamGB = $ramGB
+        InstalledRamGB = $installedRamGB
         SharedVramLimitGB = [math]::Round($ramGB / 2, 2)
         SystemDrive = $systemDrive
         FreeDiskGB = $freeDiskGB
@@ -361,9 +379,10 @@ function Invoke-HardwareDecisionEngine {
     $hardware = Get-HardwareInventory -Context $Context
     $resourcePolicy = Get-HardwareResourcePolicy `
         -Config $Context.Config
-    if ($hardware.RamGB -lt $resourcePolicy.MinimumRamGB) {
+    $ramCapacityGB = Get-HardwareRamCapacity -Hardware $hardware
+    if ($ramCapacityGB -lt $resourcePolicy.MinimumRamGB) {
         throw (Get-LocalizedText -Key 'Hardware.Error.RamInsufficient' `
-            -Arguments @($hardware.RamGB))
+            -Arguments @($ramCapacityGB))
     }
     if ($hardware.FreeDiskGB -lt
         $resourcePolicy.MinimumFreeDiskGB) {
@@ -454,7 +473,8 @@ function Assert-HardwarePolicyContracts {
         FreeDiskGB = 39
     }
     $readyHardware = [pscustomobject]@{
-        RamGB = 16
+        RamGB = 15.99
+        InstalledRamGB = 16
         FreeDiskGB = 40
     }
     $allDisabledConfig = [pscustomobject][ordered]@{

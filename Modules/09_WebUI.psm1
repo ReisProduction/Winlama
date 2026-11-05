@@ -71,6 +71,18 @@ function Get-WinlamaPythonRuntimePlan {
         VoiceProbeRequired = $VoiceEnabled
     }
 }
+function Set-WinlamaArrowSimdCompatibility {
+    $avx2 = 'System.Runtime.Intrinsics.X86.Avx2' -as [type]
+    if ($null -ne $avx2 -and -not $avx2::IsSupported -and
+        [string]::IsNullOrWhiteSpace($env:ARROW_USER_SIMD_LEVEL)) {
+        $env:ARROW_USER_SIMD_LEVEL = if ([System.Runtime.Intrinsics.X86.Sse42]::IsSupported) {
+            'SSE4_2'
+        }
+        else {
+            'NONE'
+        }
+    }
+}
 function Test-WinlamaVoiceSetupFailureOptional {
     [CmdletBinding()]
     param(
@@ -292,7 +304,7 @@ function Assert-OpenWebUIFeatureProjectionContracts {
     param()
     $context = [pscustomobject]@{
         Config = [pscustomobject]@{
-            EngineVersion = '26.8.6'
+            EngineVersion = '26.10.29'
             Ollama = [pscustomobject]@{
                 Enabled = $false
                 Port = 11434
@@ -377,7 +389,7 @@ function Assert-OpenWebUIFeatureProjectionContracts {
             -SourceHash 'SOURCE' -WorkflowHash 'WORKFLOW' `
             -Context $context -ImageGenerationEnabled $true
     if ($customMaterial -ceq $disabledMaterial -or
-        $enabledMaterial -notlike '*"EngineVersion":"26.8.6"*') {
+        $enabledMaterial -notlike '*"EngineVersion":"26.10.29"*') {
         throw 'Open WebUI yapilandirma hash malzemesi gecersiz.'
     }
     $context.Config.Voice.Enabled = $true
@@ -824,6 +836,7 @@ function Test-WinlamaVoicePythonRuntime {
         -not (Test-Path -LiteralPath $server -PathType Leaf)) {
         return $false
     }
+    Set-WinlamaArrowSimdCompatibility
     try {
         $null = Invoke-ExternalProcess -FilePath $PythonPath `
             -ArgumentList @('-I', $server, '--help') `
@@ -1290,6 +1303,7 @@ Export-ModuleMember -Function @(
     'Get-OpenWebUIRootPath', 'Get-OpenWebUIDataPath',
     'Get-OpenWebUIRuntimePath', 'Get-OpenWebUIPythonPath',
     'Get-OpenWebUIExecutablePath',
+    'Set-WinlamaArrowSimdCompatibility',
     'Get-OpenWebUIHealthUri', 'Get-OpenWebUIStartupShortcutPath',
     'Get-OpenWebUIDefaultConfigPath',
     'Read-OpenWebUIDefaultConfigDocument',

@@ -779,8 +779,24 @@ function Convert-DigestToFileName {
 }
 function Get-FileSha256 {
     param([Parameter(Mandatory)][string]$Path)
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.
-        ToLowerInvariant()
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.FileStream]::new(
+            $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            [IO.FileShare]::Read, 8MB, [IO.FileOptions]::SequentialScan
+        )
+        try {
+            return [BitConverter]::ToString(
+                $hash.ComputeHash($stream)
+            ).Replace('-', '').ToLowerInvariant()
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $hash.Dispose()
+    }
 }
 function Format-ByteSize {
     param([long]$Bytes)
@@ -1924,11 +1940,15 @@ function Get-ManagerOllamaExecutable {
     return $null
 }
 function Get-ManagerOllamaApplicationExecutable {
+    param([switch]$AllowMissing)
     $root = Expand-ManagerPath -Path `
         $script:ManagerConfig.Ollama.InstallPath
     $path = Join-Path $root 'ollama app.exe'
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         return [IO.Path]::GetFullPath($path)
+    }
+    if ($AllowMissing) {
+        return $null
     }
     throw (Get-LocalizedText `
         -Key 'Ollama.Error.ApplicationExecutableMissing')
@@ -1976,6 +1996,9 @@ function Start-ManagerOllamaApplication {
     $process.Dispose()
 }
 function Start-OllamaForVerification {
+    if ($null -eq (Get-ManagerOllamaApplicationExecutable -AllowMissing)) {
+        return $false
+    }
     $apiReady = Test-ManagerOllamaApi
     $applicationRunning = Test-ManagerOllamaApplicationRunning
     if ($apiReady -and $applicationRunning) {
@@ -2031,7 +2054,9 @@ function Assert-ManagerOllamaApplicationContracts {
 }
 function Test-ImportedModelsWithApi {
     param([Parameter(Mandatory)][object[]]$Packages)
-    if (-not $script:ManagerConfig.ModelTransfer.VerifyAfterImport) {
+    if (-not $script:ManagerConfig.ModelTransfer.VerifyAfterImport -or
+        -not [bool](Get-JsonValue -InputObject $script:ManagerConfig.Ollama `
+            -Name Enabled -DefaultValue $true)) {
         return
     }
     if (-not (Start-OllamaForVerification)) {
@@ -2557,6 +2582,7 @@ function Invoke-ManagerInternetDownload {
                     -ArgumentList @('pull', $Model.Name) `
                     -WorkingDirectory (Split-Path -Parent $ollama) `
                     -NoNewWindow -PassThru
+                [void]$process.Handle
                 if (-not $process.WaitForExit($timeout * 1000)) {
                     Stop-Process -Id $process.Id -Force `
                         -ErrorAction SilentlyContinue
@@ -2963,6 +2989,18 @@ function Get-ComfyUIModelAssetPath {
     return Resolve-SafeChildPath -Root $root `
         -RelativePath ([string]$Asset.RelativePath)
 }
+function Test-ComfyUIAssetFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedHash
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or
+        (Get-Item -LiteralPath $Path).Length -eq 0) {
+        return $false
+    }
+    return [string]::IsNullOrWhiteSpace($ExpectedHash) -or
+        (Get-FileSha256 -Path $Path) -ieq $ExpectedHash
+}
 function Test-ComfyUIModelInstalled {
     param(
         [Parameter(Mandatory)][pscustomobject]$Model,
@@ -2971,29 +3009,18 @@ function Test-ComfyUIModelInstalled {
     $root = Get-ComfyUIModelsRoot
     $name = Get-ComfyUIModelDirectoryName -Model $Model
     $directory = Join-Path $root $name
-    $marker = Join-Path $directory '.winlama-local-model'
-    if ((Test-Path -LiteralPath $marker -PathType Leaf) -and
-        @(Get-ComfyUIModelFiles -Path $directory).Count -gt 0) {
-        return $true
-    }
     $assets = @(Get-ComfyUIModelAssets -Model $Model)
     if ($assets.Count -eq 0) {
         return @(Get-ComfyUIModelFiles -Path $directory).Count -gt 0
     }
     foreach ($asset in $assets) {
         $path = Get-ComfyUIModelAssetPath -Asset $asset
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            return $false
+        $expectedHash = if ($VerifyHash) {
+            [string](Get-JsonValue -InputObject $asset `
+                -Name Sha256 -DefaultValue '')
         }
-        if ((Get-Item -LiteralPath $path).Length -eq 0) {
-            return $false
-        }
-        $expectedHash = [string](Get-JsonValue `
-            -InputObject $asset -Name Sha256 -DefaultValue '')
-        if ($VerifyHash -and
-            -not [string]::IsNullOrWhiteSpace($expectedHash) -and
-            (Get-FileSha256 -Path $path) -ne
-                $expectedHash.ToLowerInvariant()) {
+        if (-not (Test-ComfyUIAssetFile -Path $path `
+            -ExpectedHash $expectedHash)) {
             return $false
         }
     }
@@ -3084,9 +3111,6 @@ function Test-ComfyUILocalModelCopied {
         [Parameter(Mandatory)][pscustomobject]$Model,
         [Parameter(Mandatory)][string]$Source
     )
-    if (@(Get-ComfyUIModelAssets -Model $Model).Count -gt 0) {
-        return Test-ComfyUIModelInstalled -Model $Model -VerifyHash
-    }
     $destination = Join-Path (Get-ComfyUIModelsRoot) `
         (Get-ComfyUIModelDirectoryName -Model $Model)
     foreach ($file in @(Get-ComfyUIModelFiles -Path $Source)) {
@@ -3105,13 +3129,7 @@ function Copy-ComfyUILocalModel {
         [Parameter(Mandatory)][string]$Source
     )
     if (@(Get-ComfyUIModelAssets -Model $Model).Count -gt 0) {
-        $null = Install-ComfyUIModelPayload -Model $Model
-        if (-not (Test-ComfyUIModelInstalled `
-            -Model $Model -VerifyHash)) {
-            throw (Get-LocalizedText `
-                -Key 'Manager.ComfyUI.VerificationFailed' `
-                -Arguments @($Model.Name))
-        }
+        Install-ComfyUIModelPayload -Model $Model
         return
     }
     $root = Get-ComfyUIModelsRoot
@@ -3156,11 +3174,6 @@ function Copy-ComfyUILocalModel {
             -Key 'Installer.ComfyUI.LocalCopyFailed' `
             -Arguments @($Model.Name, $exitCode))
     }
-    [IO.File]::WriteAllText(
-        (Join-Path $destination '.winlama-local-model'),
-        [string]$Model.Name,
-        [Text.UTF8Encoding]::new($false)
-    )
 }
 function Assert-ComfyUIDownloadDiskSpace {
     param([Parameter(Mandatory)][pscustomobject]$Model)
@@ -3170,18 +3183,10 @@ function Assert-ComfyUIDownloadDiskSpace {
     $requiredGB = 0.0
     foreach ($asset in @(Get-ComfyUIModelAssets -Model $Model)) {
         $path = Get-ComfyUIModelAssetPath -Asset $asset
-        $requiresDownload = -not (
-            Test-Path -LiteralPath $path -PathType Leaf
-        )
         $expectedHash = [string](Get-JsonValue `
             -InputObject $asset -Name Sha256 -DefaultValue '')
-        if (-not $requiresDownload -and
-            -not [string]::IsNullOrWhiteSpace($expectedHash) -and
-            (Get-FileSha256 -Path $path) -ne
-                $expectedHash.ToLowerInvariant()) {
-            $requiresDownload = $true
-        }
-        if ($requiresDownload) {
+        if (-not (Test-ComfyUIAssetFile -Path $path `
+            -ExpectedHash $expectedHash)) {
             $requiredGB += [double](Get-JsonValue `
                 -InputObject $asset -Name SizeGB -DefaultValue 0)
         }
@@ -3202,20 +3207,23 @@ function Assert-ComfyUIDownloadDiskSpace {
 }
 function Install-ComfyUIModelPayload {
     param([Parameter(Mandatory)][pscustomobject]$Model)
-    $downloaded = 0
-    foreach ($asset in @(Get-ComfyUIModelAssets -Model $Model)) {
+    $assets = @(Get-ComfyUIModelAssets -Model $Model)
+    if ($assets.Count -eq 0) {
+        throw (Get-LocalizedText `
+            -Key 'Manager.ComfyUI.VerificationFailed' `
+            -Arguments @($Model.Name))
+    }
+    $sourceRoots = @(Get-ComfyUIModelSourceRoots)
+    foreach ($asset in $assets) {
         $target = Get-ComfyUIModelAssetPath -Asset $asset
         $expectedHash = [string](Get-JsonValue `
             -InputObject $asset -Name Sha256 -DefaultValue '')
-        if (Test-Path -LiteralPath $target -PathType Leaf) {
-            if ([string]::IsNullOrWhiteSpace($expectedHash) -or
-                (Get-FileSha256 -Path $target) -eq
-                    $expectedHash.ToLowerInvariant()) {
-                continue
-            }
+        if (Test-ComfyUIAssetFile -Path $target `
+            -ExpectedHash $expectedHash) {
+            continue
         }
         $packageAsset = $null
-        foreach ($packageRoot in @(Get-ComfyUIModelSourceRoots)) {
+        foreach ($packageRoot in $sourceRoots) {
             $candidate = Resolve-SafeChildPath -Root $packageRoot `
                 -RelativePath ([string]$asset.RelativePath)
             if (Test-Path -LiteralPath $candidate -PathType Leaf) {
@@ -3223,66 +3231,44 @@ function Install-ComfyUIModelPayload {
                 break
             }
         }
-        if ($null -ne $packageAsset) {
-            if (-not [string]::IsNullOrWhiteSpace($expectedHash) -and
-                (Get-FileSha256 -Path $packageAsset) -ne
-                    $expectedHash.ToLowerInvariant()) {
+        if ($null -eq $packageAsset) {
+            $uri = [uri]$asset.Uri
+            if ($uri.Scheme -ne 'https') {
                 throw (Get-LocalizedText `
-                    -Key 'Manager.ComfyUI.HashMismatch' `
-                    -Arguments @($Model.Name, $asset.RelativePath))
+                    -Key 'Manager.ComfyUI.InsecureUri' `
+                    -Arguments @($uri.AbsoluteUri))
             }
-            [IO.Directory]::CreateDirectory(
-                (Split-Path -Parent $target)
-            ) | Out-Null
-            $temporary = '{0}.{1}.copy' -f $target, $PID
-            try {
-                Copy-Item -LiteralPath $packageAsset `
-                    -Destination $temporary -Force
-                Move-Item -LiteralPath $temporary `
-                    -Destination $target -Force
-                $downloaded++
-                continue
-            }
-            finally {
-                Remove-Item -LiteralPath $temporary -Force `
-                    -ErrorAction SilentlyContinue
-            }
-        }
-        $uri = [uri]$asset.Uri
-        if ($uri.Scheme -ne 'https') {
-            throw (Get-LocalizedText `
-                -Key 'Manager.ComfyUI.InsecureUri' `
-                -Arguments @($uri.AbsoluteUri))
         }
         [IO.Directory]::CreateDirectory(
             (Split-Path -Parent $target)
         ) | Out-Null
-        $temporary = '{0}.{1}.download' -f $target, $PID
+        $temporary = '{0}.{1}.pending' -f $target, $PID
         Remove-Item -LiteralPath $temporary -Force `
             -ErrorAction SilentlyContinue
         try {
-            Invoke-WebRequest -Uri $uri.AbsoluteUri `
-                -OutFile $temporary -UseBasicParsing `
-                -TimeoutSec ([int]$script:ManagerConfig.
-                    Network.DownloadTimeoutSeconds)
-            if (-not [string]::IsNullOrWhiteSpace($expectedHash)) {
-                $actualHash = Get-FileSha256 -Path $temporary
-                if ($actualHash -ne $expectedHash.ToLowerInvariant()) {
-                    throw (Get-LocalizedText `
-                        -Key 'Manager.ComfyUI.HashMismatch' `
-                        -Arguments @($Model.Name, $asset.RelativePath))
-                }
+            if ($null -eq $packageAsset) {
+                Save-WinlamaWebFile -Uri $uri -OutFile $temporary `
+                    -TimeoutSec ([int]$script:ManagerConfig.
+                        Network.DownloadTimeoutSeconds)
+            }
+            else {
+                Copy-Item -LiteralPath $packageAsset `
+                    -Destination $temporary -Force
+            }
+            if (-not (Test-ComfyUIAssetFile -Path $temporary `
+                -ExpectedHash $expectedHash)) {
+                throw (Get-LocalizedText `
+                    -Key 'Manager.ComfyUI.HashMismatch' `
+                    -Arguments @($Model.Name, $asset.RelativePath))
             }
             Move-Item -LiteralPath $temporary `
                 -Destination $target -Force
-            $downloaded++
         }
         finally {
             Remove-Item -LiteralPath $temporary -Force `
                 -ErrorAction SilentlyContinue
         }
     }
-    return $downloaded
 }
 function Resolve-ComfyUISelection {
     param(
@@ -3410,13 +3396,7 @@ function Invoke-ComfyUIDownloadAction {
         Write-ManagerStatus -Level INFO `
             -Message 'Manager.ComfyUI.DownloadStarting' `
             -MessageArguments @($item.Model.Name)
-        $null = Install-ComfyUIModelPayload -Model $item.Model
-        if (-not (Test-ComfyUIModelInstalled `
-            -Model $item.Model -VerifyHash)) {
-            throw (Get-LocalizedText `
-                -Key 'Manager.ComfyUI.VerificationFailed' `
-                -Arguments @($item.Model.Name))
-        }
+        Install-ComfyUIModelPayload -Model $item.Model
         Write-ManagerStatus -Level OK `
             -Message 'Manager.ComfyUI.DownloadCompleted' `
             -MessageArguments @($item.Model.Name)
@@ -3476,11 +3456,9 @@ function Invoke-ComfyUIDeleteAction {
     )
     foreach ($item in $selected) {
         $assets = @(Get-ComfyUIModelAssets -Model $item.Model)
-        $directory = Join-Path (Get-ComfyUIModelsRoot) `
-            (Get-ComfyUIModelDirectoryName -Model $item.Model)
-        $marker = Join-Path $directory '.winlama-local-model'
-        if ($assets.Count -eq 0 -or
-            (Test-Path -LiteralPath $marker -PathType Leaf)) {
+        if ($assets.Count -eq 0) {
+            $directory = Join-Path (Get-ComfyUIModelsRoot) `
+                (Get-ComfyUIModelDirectoryName -Model $item.Model)
             if (Test-Path -LiteralPath $directory -PathType Container) {
                 Remove-Item -LiteralPath $directory -Recurse -Force
             }
@@ -3578,156 +3556,7 @@ function Invoke-InteractiveManagerAction {
         -Level $(if ($failed) { 'ERROR' } else { 'SUCCESS' }) `
         -Command DEVAM -InputReader $PauseReader
 }
-function Get-ComputerModelsMenuItems {
-    return @(
-        [pscustomobject]@{ Choice = '1';
-            Key = 'Manager.Computer.List'; Action = 'List';
-            Color = 'White' }
-        [pscustomobject]@{ Choice = '2';
-            Key = 'Manager.Computer.Download'; Action = 'Download';
-            Color = 'Green' }
-        [pscustomobject]@{ Choice = '3';
-            Key = 'Manager.Computer.Import'; Action = 'Import';
-            Color = 'Cyan' }
-        [pscustomobject]@{ Choice = '4';
-            Key = 'Manager.Computer.Export'; Action = 'Export';
-            Color = 'Magenta' }
-        [pscustomobject]@{ Choice = '5';
-            Key = 'Manager.Computer.Delete'; Action = 'Delete';
-            Color = 'Red' }
-    )
-}
-function Get-InstallationModelsMenuItems {
-    return @(
-        [pscustomobject]@{ Choice = '1';
-            Key = 'Manager.Installation.List'; Action = 'Packages';
-            Color = 'White' }
-        [pscustomobject]@{ Choice = '2';
-            Key = 'Manager.Installation.Verify'; Action = 'Verify';
-            Color = 'Green' }
-        [pscustomobject]@{ Choice = '3';
-            Key = 'Manager.Installation.Import'; Action = 'Export';
-            Color = 'Magenta' }
-        [pscustomobject]@{ Choice = '4';
-            Key = 'Manager.Installation.Export'; Action = 'Import';
-            Color = 'Cyan' }
-        [pscustomobject]@{ Choice = '5';
-            Key = 'Manager.Installation.Delete';
-            Action = 'PackageDelete'; Color = 'Red' }
-    )
-}
-function Get-ComfyUIModelsMenuItems {
-    return @(
-        [pscustomobject]@{ Choice = '1';
-            Key = 'Manager.ComfyUI.List'; Action = 'ComfyUIList';
-            Color = 'White' }
-        [pscustomobject]@{ Choice = '2';
-            Key = 'Manager.ComfyUI.Download'; Action = 'ComfyUIDownload';
-            Color = 'Green' }
-        [pscustomobject]@{ Choice = '3';
-            Key = 'Manager.ComfyUI.Delete'; Action = 'ComfyUIDelete';
-            Color = 'Red' }
-    )
-}
-function Get-ManagerMainMenuItems {
-    return @(
-        [pscustomobject]@{ Choice = '1'; Key = 'Manager.Menu.Computer';
-            Color = 'Green'; Arguments = @() }
-        [pscustomobject]@{ Choice = '2'; Key = 'Manager.Menu.Installation';
-            Color = 'Cyan'; Arguments = @() }
-        [pscustomobject]@{ Choice = '3'; Key = 'Manager.Menu.ComfyUIModels';
-            Color = 'Magenta'; Arguments = @('3') }
-        [pscustomobject]@{ Choice = '4'; Key = 'Manager.Menu.Repair';
-            Color = 'Yellow'; Arguments = @() }
-        [pscustomobject]@{ Choice = '5'; Key = 'Manager.Menu.Uninstall';
-            Color = 'Red'; Arguments = @() }
-        [pscustomobject]@{ Choice = '0'; Key = 'Manager.Menu.Exit';
-            Color = 'Gray'; Arguments = @() }
-    )
-}
-function Assert-ManagerMenuContract {
-    param(
-        [Parameter(Mandatory)][object[]]$Items,
-        [Parameter(Mandatory)][string[]]$ExpectedColors,
-        [switch]$HasBack
-    )
-    $expected = @(1..$Items.Count | ForEach-Object { [string]$_ })
-    if ($Items[-1].Choice -eq '0') {
-        $expected = @(1..($Items.Count - 1) |
-            ForEach-Object { [string]$_ }) + '0'
-    }
-    if (($Items.Choice -join ',') -ne ($expected -join ',')) {
-        throw 'Model yoneticisi menu numaralari veya sirasi gecersiz.'
-    }
-    if (($Items.Color -join ',') -ne ($ExpectedColors -join ',')) {
-        throw 'Model yoneticisi menu renk sirasi gecersiz.'
-    }
-    $texts = @()
-    foreach ($item in $Items) {
-        $arguments = if ($null -ne `
-            $item.PSObject.Properties['Arguments']) {
-            @($item.Arguments)
-        }
-        else {
-            @()
-        }
-        $text = if (@($arguments).Count -gt 0) {
-            Get-LocalizedText -Key $item.Key -Arguments $arguments
-        }
-        else {
-            Get-LocalizedText -Key $item.Key
-        }
-        if ($text -notmatch ('^\s*\[{0}\]\s+\S' -f $item.Choice)) {
-            throw "Model yoneticisi menu etiketi gecersiz: $($item.Key)"
-        }
-        $texts += $text.Trim()
-    }
-    if (@($texts | Sort-Object -Unique).Count -ne $Items.Count) {
-        throw 'Model yoneticisi menusunde yinelenen etiket var.'
-    }
-    if ($HasBack) {
-        $back = Get-LocalizedText -Key 'Manager.Menu.Back'
-        if ($back -notmatch '^\s*\[0\]\s+\S') {
-            throw 'Model yoneticisi geri etiketi gecersiz.'
-        }
-    }
-}
-function Show-ManagerActionMenuLayout {
-    param(
-        [Parameter(Mandatory)][string]$Title,
-        [Parameter(Mandatory)][object[]]$Items,
-        [string]$Notice
-    )
-    Write-ManagerBanner
-    Show-ManagerPaths
-    Write-ManagerSection -Title $Title -NoLeadingRule
-    if (-not [string]::IsNullOrWhiteSpace($Notice)) {
-        Write-ManagerLine -Text (Get-LocalizedText -Key $Notice) `
-            -Color Cyan
-        Write-ManagerRule
-    }
-    foreach ($item in $Items) {
-        Write-ManagerLine -Text (Get-LocalizedText `
-            -Key $item.Key) -Color $item.Color
-    }
-    Write-ManagerLine -Text (Get-LocalizedText `
-        -Key 'Manager.Menu.Back') -Color Gray
-    Write-ManagerRule
-}
-function Show-ManagerMainMenu {
-    Write-ManagerBanner
-    Show-ManagerPaths
-    foreach ($item in @(Get-ManagerMainMenuItems)) {
-        $text = if (@($item.Arguments).Count -gt 0) {
-            Get-LocalizedText -Key $item.Key -Arguments $item.Arguments
-        }
-        else {
-            Get-LocalizedText -Key $item.Key
-        }
-        Write-ManagerLine -Text $text -Color $item.Color
-    }
-    Write-ManagerRule
-}
+. (Join-Path $PSScriptRoot 'Modules\ModelManager\Menu.ps1')
 function Show-ManagerPromptValidation {
     $keys = @(
         'Manager.Prompt.Models',
@@ -3758,7 +3587,7 @@ function Show-ManagerPromptValidation {
             }
             $text = '{0}:' -f $text.TrimEnd(':')
         }
-        elseif ($text -match '[^\x00-\x7F]') {
+        elseif ($text -cmatch '[^\x00-\x7F]') {
             throw "Model yoneticisi istemi gecersiz: $key"
         }
         Write-ManagerLine -Text $text -Color White

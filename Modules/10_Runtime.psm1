@@ -311,6 +311,7 @@ function Start-OllamaApplication {
     param(
         [Parameter(Mandatory)]
         [pscustomobject]$Context,
+        [switch]$Restart,
         [switch]$Attached
     )
     $runtimePath = Join-Path $Context.DataPath 'ollama.runtime.json'
@@ -329,7 +330,7 @@ function Start-OllamaApplication {
     $environmentChanged = $null -ne $runtime -and
         $null -ne $runtime.PSObject.Properties['EnvironmentChanged'] -and
         [bool]$runtime.EnvironmentChanged
-    if ($apiReady -and $safeListener -and $applicationReady -and
+    if (-not $Restart -and $apiReady -and $safeListener -and $applicationReady -and
         -not $environmentChanged) {
         Write-DeploymentLog -Context $Context -Level INFO `
             -Module RUNTIME -Message 'Runtime.Ollama.AlreadyReady'
@@ -340,20 +341,9 @@ function Start-OllamaApplication {
             -Module RUNTIME `
             -Message 'Runtime.Ollama.UnsafeListenerRestart'
     }
-    try {
-        Stop-ProcessesFromPath `
-            -RootPath (Get-OllamaInstallPath -Context $Context) `
-            -TimeoutSeconds $Context.Config.Runtime.ShutdownTimeoutSeconds
-    }
-    catch {
-        Write-DeploymentLog -Context $Context -Level WARN `
-            -Module RUNTIME `
-            -Message 'Runtime.Ollama.ProcessStopFailed' `
-            -MessageArguments @($_.Exception.Message)
-    }
-    Get-Process -Name 'ollama', 'ollama app', 'ollama_llama_server' `
-        -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    $installPath = Get-OllamaInstallPath -Context $Context
+    Stop-ProcessesFromPath -RootPath $installPath `
+        -TimeoutSeconds $Context.Config.Runtime.ShutdownTimeoutSeconds
     $listener = Get-PortListener -Port $Context.Config.Ollama.Port
     if ($null -ne $listener) {
         throw (Get-LocalizedText -Key 'Runtime.Error.OllamaPortOccupied' `
@@ -391,19 +381,13 @@ function Start-OllamaApplication {
     catch {
         $failure = $_
         try {
-            Stop-ProcessesFromPath `
-                -RootPath (Get-OllamaInstallPath -Context $Context) `
-                -TimeoutSeconds `
-                    $Context.Config.Runtime.ShutdownTimeoutSeconds
+            Stop-ProcessesFromPath -RootPath $installPath `
+                -TimeoutSeconds $Context.Config.Runtime.ShutdownTimeoutSeconds
         }
         catch {
             Write-Verbose ('Ollama hata temizligi basarisiz: {0}' -f `
                 $_.Exception.Message)
         }
-        Get-Process -Name `
-            'ollama', 'ollama app', 'ollama_llama_server' `
-            -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
         throw $failure
     }
     finally {
@@ -429,6 +413,8 @@ function Assert-OllamaRuntimeLaunchContracts {
     if ($source -notmatch 'Get-OllamaApplicationExecutable' -or
         $source -notmatch 'Get-OllamaApplicationArgumentList' -or
         $source -notmatch 'Test-OllamaApplicationRunning' -or
+        $source -notmatch '\$Restart' -or
+        $source -match 'Get-Process\s+-Name' -or
         $source -match 'Get-OllamaExecutable' -or
         $source -match "ArgumentList\s*=\s*'serve'" -or
         $source -match 'NoNewWindow' -or
@@ -563,6 +549,7 @@ function Set-OpenWebUIEnvironment {
     foreach ($entry in $values.GetEnumerator()) {
         Set-Item -Path "Env:$($entry.Key)" -Value $entry.Value
     }
+    Set-WinlamaArrowSimdCompatibility
 }
 function Stop-OpenWebUIRuntime {
     [CmdletBinding()]
@@ -573,8 +560,19 @@ function Stop-OpenWebUIRuntime {
     if (-not $Context.Config.OpenWebUI.Enabled) {
         return
     }
+    $executable = Get-OpenWebUIExecutablePath -Context $Context
+    $readWebUIProcesses = {
+        Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
+            Where-Object {
+                [string]$_.ExecutablePath -ieq $executable -or
+                    ([string]$_.CommandLine).IndexOf(
+                        $executable, [StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+            }
+    }.GetNewClosure()
     Stop-ProcessesFromPath `
         -RootPath (Get-OpenWebUIRuntimePath -Context $Context) `
+        -ProcessReader $readWebUIProcesses `
         -TimeoutSeconds $Context.Config.Runtime.ShutdownTimeoutSeconds
 }
 function Start-OpenWebUIRuntime {
@@ -711,7 +709,9 @@ function Test-WinlamaTtsReady {
             $client.Dispose()
             $handler.Dispose()
         }
+        $bilingual = $Context.Config.Voice.PSObject.Properties['Bilingual']
         return Test-WinlamaTtsHealthContract -Health $health `
+            -ExpectedBilingual:($null -ne $bilingual -and [bool]$bilingual.Value) `
             -ExpectedModel ([string]$Context.Config.Voice.Model) `
             -ExpectedRevision ([string]$Context.Config.Voice.Revision) `
             -ExpectedLanguage ([string]$Context.Config.Voice.Language)
@@ -730,7 +730,8 @@ function Test-WinlamaTtsHealthContract {
         [Parameter(Mandatory)][string]$ExpectedRevision,
         [Parameter(Mandatory)]
         [ValidateSet('tr', 'en')]
-        [string]$ExpectedLanguage
+        [string]$ExpectedLanguage,
+        [switch]$ExpectedBilingual
     )
     if ([string]::IsNullOrWhiteSpace($ExpectedModel) -or
         $ExpectedRevision -notmatch '^[a-f0-9]{40}$') {
@@ -741,6 +742,12 @@ function Test-WinlamaTtsHealthContract {
         $model = $Health.PSObject.Properties['model']
         $revision = $Health.PSObject.Properties['revision']
         $language = $Health.PSObject.Properties['language']
+        $voices = $Health.PSObject.Properties['voices']
+        $expectedVoices = if ($ExpectedBilingual) { 'en,tr' } else { $ExpectedLanguage }
+        if (($ExpectedBilingual -and $null -eq $voices) -or
+            ($null -ne $voices -and (($voices.Value | Sort-Object) -join ',') -cne $expectedVoices)) {
+            return $false
+        }
         return $null -ne $ready -and $ready.Value -is [bool] -and
             [bool]$ready.Value -and $null -ne $model -and
             [string]$model.Value -ceq $ExpectedModel -and
@@ -984,9 +991,12 @@ function Start-WinlamaTtsRuntime {
     foreach ($path in @($cacheDirectory)) {
         [IO.Directory]::CreateDirectory($path) | Out-Null
     }
+    Set-WinlamaArrowSimdCompatibility
     $env:WINLAMA_TTS_MODEL = [string]$Context.Config.Voice.Model
     $env:WINLAMA_TTS_REVISION = [string]$Context.Config.Voice.Revision
     $env:WINLAMA_TTS_LANGUAGE = [string]$Context.Config.Voice.Language
+    $bilingual = $Context.Config.Voice.PSObject.Properties['Bilingual']
+    $env:WINLAMA_TTS_BILINGUAL = if ($null -ne $bilingual -and [bool]$bilingual.Value) { '1' } else { '0' }
     $env:WINLAMA_TTS_CACHE = $cacheDirectory
     $env:WINLAMA_TTS_MESSAGES = (
         Get-WinlamaTtsLocalizedMessages | ConvertTo-Json -Compress
@@ -1581,6 +1591,83 @@ function New-ComfyUIChildPowerShellArgumentList {
         '-NoPause', '-Background'
     )
 }
+function Start-ComfyUIInteractiveUserProcess {
+    param([Parameter(Mandatory)][hashtable]$Start)
+    $taskName = 'Winlama-ComfyUI-' + [guid]::NewGuid().ToString('N')
+    $resultPath = Join-Path `
+        (Split-Path -Parent $Start.RedirectStandardOutput) "$taskName.json"
+    $launch = @{ Parameters = $Start; ResultPath = $resultPath } |
+        ConvertTo-Json -Depth 8 -Compress
+    $payload = [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes($launch)
+    )
+    $command = '$payload = ''{0}''' -f $payload
+    $command += [Environment]::NewLine + @'
+$ErrorActionPreference = 'Stop'
+$launch = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) |
+    ConvertFrom-Json -AsHashtable
+$parameters = $launch.Parameters
+try {
+    $process = Start-Process @parameters
+    $result = @{ ProcessId = $process.Id; Error = '' }
+    $process.Dispose()
+}
+catch {
+    $result = @{ ProcessId = 0; Error = $_.Exception.Message }
+}
+$temporary = $launch.ResultPath + '.tmp'
+[IO.File]::WriteAllText($temporary, ($result | ConvertTo-Json -Compress))
+[IO.File]::Move($temporary, $launch.ResultPath)
+'@
+    $encoded = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($command)
+    )
+    $arguments = '-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden ' +
+        "-EncodedCommand $encoded"
+    $action = New-ScheduledTaskAction -Execute $Start.FilePath `
+        -Argument $arguments -WorkingDirectory $Start.WorkingDirectory
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $principal = New-ScheduledTaskPrincipal -UserId $sid `
+        -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries
+    $null = Register-ScheduledTask -TaskName $taskName -Action $action `
+        -Principal $principal -Settings $settings -ErrorAction Stop
+    try {
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+            if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                Stop-ScheduledTask -TaskName $taskName `
+                    -ErrorAction SilentlyContinue
+                throw (Get-LocalizedText `
+                    -Key 'Runtime.Error.ComfyUIUserLaunchTimeout')
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        $result = Read-JsonFile -Path $resultPath
+        if ([int]$result.ProcessId -le 0) {
+            throw (Get-LocalizedText `
+                -Key 'Runtime.Error.ComfyUIUserLaunchFailed' `
+                -Arguments @([string]$result.Error))
+        }
+        $process = Get-Process -Id ([int]$result.ProcessId) -ErrorAction Stop
+        if ($process.Path -ine $Start.FilePath) {
+            $process.Dispose()
+            throw (Get-LocalizedText `
+                -Key 'Runtime.Error.ComfyUIUserLaunchFailed' `
+                -Arguments @($Start.FilePath))
+        }
+        $null = $process.Handle
+        return $process
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false `
+            -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $resultPath, "$resultPath.tmp" -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
 function Start-ComfyUIRuntime {
     [CmdletBinding()]
     param(
@@ -1600,6 +1687,11 @@ function Start-ComfyUIRuntime {
         return
     }
     Stop-ComfyUIRuntime -Context $Context
+    if (Test-TcpEndpoint -HostName '127.0.0.1' `
+        -Port ([int]$Context.Config.ComfyUI.Port)) {
+        throw (Get-LocalizedText -Key 'Runtime.Error.ComfyUIListenerStillActive' `
+            -Arguments @($Context.Config.ComfyUI.Port))
+    }
     $scriptPath = @(
         (Join-Path $Context.AppPath 'Modules\UI\ComfyUI.ps1'),
         (Join-Path $Context.PackageRoot 'Modules\UI\ComfyUI.ps1')
@@ -1650,7 +1742,14 @@ function Start-ComfyUIRuntime {
         $start.RedirectStandardOutput = $outputPath
         $start.RedirectStandardError = $errorPath
     }
-    $process = Start-Process @start
+    $interactiveUserLaunch = -not $Attached -and
+        [Environment]::UserInteractive -and (Test-IsAdministrator)
+    $process = if ($interactiveUserLaunch) {
+        Start-ComfyUIInteractiveUserProcess -Start $start
+    }
+    else {
+        Start-Process @start
+    }
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(180)
     do {
         if (Test-ComfyUIReady -Context $Context) {
@@ -1669,7 +1768,7 @@ function Start-ComfyUIRuntime {
         Start-Sleep -Seconds $Context.Config.Runtime.PollIntervalSeconds
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
     Stop-ComfyUIRuntime -Context $Context
-    if (-not $process.HasExited) {
+    if (-not $interactiveUserLaunch -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force `
             -ErrorAction SilentlyContinue
     }
@@ -1914,16 +2013,8 @@ function Start-AiRuntime {
     if ($OllamaMode -ne 'Skip' -and $Context.Config.Ollama.Enabled) {
         $null = Invoke-AiRuntimeAction -Name 'Ollama' `
             -Failures $failures -FailureReporter $reportFailure -Action {
-                if ($OllamaMode -eq 'Restart' -and
-                    (Test-OllamaApiReady -Context $Context)) {
-                    Write-DeploymentLog -Context $Context -Level INFO `
-                        -Module RUNTIME `
-                        -Message 'Runtime.Ollama.KeptRunning'
-                }
-                else {
-                    Start-OllamaApplication -Context $Context `
-                        -Attached:$Attached
-                }
+                Start-OllamaApplication -Context $Context `
+                    -Restart:($OllamaMode -eq 'Restart') -Attached:$Attached
             }
     }
     if ($OpenWebUIMode -ne 'Skip' -and

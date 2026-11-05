@@ -47,6 +47,7 @@ if not exist "%WINLAMA_POWERSHELL%" (
     if not defined WINLAMA_NO_PAUSE call :WAIT_EXIT
     exit /b 1
 )
+setlocal DisableDelayedExpansion
 "%WINLAMA_POWERSHELL%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launcher.ps1" -RunMeHost %*
 set "WINLAMA_EXIT=%ERRORLEVEL%"
 exit /b %WINLAMA_EXIT%

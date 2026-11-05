@@ -1,6 +1,6 @@
 {
   "ProjectName": "Winlama",
-  "EngineVersion": "26.8.6",
+  "EngineVersion": "26.10.29",
   "MinimumPowerShellVersion": "7.6.0",
   "Localization": {
     "Directory": "String",
@@ -176,6 +176,7 @@
     "Host": "127.0.0.1",
     "Port": 8880,
     "Language": "tr",
+    "Bilingual": false,
     "Model": "facebook/mms-tts-tur",
     "Revision": "7e364479c307f06733ca865b0a5269e0209cf82d",
     "StartupTimeoutSeconds": 600

@@ -9,6 +9,7 @@ param(
     )]
     [string]$Mode = 'Menu',
     [switch]$Apply,
+    [switch]$Preview,
     [switch]$SkipInstaller,
     [switch]$ValidateOnly,
     [switch]$NoPause,
@@ -1043,7 +1044,10 @@ function Show-RepairPackageSelection {
 function Select-RepairPackageRoot {
     param(
         [string]$RequestedRoot,
+        [string]$RecordedRoot,
         [string[]]$Candidates,
+        [switch]$AllowPathInput,
+        [switch]$NonInteractive,
         [scriptblock]$InputReader
     )
     if (-not [string]::IsNullOrWhiteSpace($RequestedRoot)) {
@@ -1054,6 +1058,21 @@ function Select-RepairPackageRoot {
         }
         return $resolved
     }
+    if (-not [string]::IsNullOrWhiteSpace($RecordedRoot)) {
+        try {
+            $recorded = Resolve-RepairPath -Path $RecordedRoot
+            if ((Test-RepairPackageRoot -Root $recorded) -and
+                (Test-RepairManagedConfigurationSafe -Path (
+                    Resolve-RepairConfigPath -Root $recorded
+                ))) {
+                return $recorded
+            }
+        }
+        catch {
+            Write-Verbose (Get-RepairText -Key 'Repair.Verbose.CandidateSkipped' `
+                -Arguments @($RecordedRoot, $_.Exception.Message))
+        }
+    }
     $candidates = if ($null -eq $Candidates) {
         @(Get-RepairPackageCandidates)
     }
@@ -1061,10 +1080,19 @@ function Select-RepairPackageRoot {
         @($Candidates)
     }
     if ($candidates.Count -eq 0) {
+        if ($AllowPathInput) {
+            $path = Read-RepairInput -Prompt (Get-RepairText `
+                -Key 'Repair.Prompt.SourcePath') -InputReader $InputReader
+            return Select-RepairPackageRoot -RequestedRoot $path `
+                -Candidates @()
+        }
         throw (Get-RepairText -Key 'Repair.Error.SourceMissing')
     }
     if ($candidates.Count -eq 1) {
         return $candidates[0]
+    }
+    if ($NonInteractive) {
+        throw (Get-RepairText -Key 'Repair.Error.SourceRequired')
     }
     Show-RepairPackageSelection -Candidates $candidates
     while ($true) {
@@ -1268,18 +1296,29 @@ function Assert-RepairRootsDisjoint {
 function Get-RepairSafeTreeFiles {
     param([Parameter(Mandatory)][string]$Root)
     $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
-    Assert-RepairNoReparsePoint -Path $fullRoot
-    $directories = [Collections.Generic.Queue[string]]::new()
+    $attributesProvider = {
+        param([string]$Candidate)
+        return @{ Attributes = [IO.File]::GetAttributes($Candidate) }
+    }
+    $prefix = $fullRoot + '\'
+    $directories = [Collections.Generic.Queue[IO.DirectoryInfo]]::new()
     $files = [Collections.Generic.List[IO.FileInfo]]::new()
-    $directories.Enqueue($fullRoot)
+    $directories.Enqueue([IO.DirectoryInfo]::new($fullRoot))
     while ($directories.Count -gt 0) {
         $directory = $directories.Dequeue()
-        foreach ($item in @(Get-ChildItem -LiteralPath $directory `
-            -Force -ErrorAction Stop)) {
-            Assert-RepairSafeTreePath -Root $fullRoot `
-                -Path $item.FullName
-            if ($item.PSIsContainer) {
-                $directories.Enqueue($item.FullName)
+        Assert-RepairNoReparsePoint -Path $directory.FullName `
+            -ItemProvider $attributesProvider
+        foreach ($item in $directory.EnumerateFileSystemInfos()) {
+            if (-not $item.FullName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw (Get-RepairText -Key 'Repair.Error.PathOutsideScope' `
+                    -Arguments @($item.FullName, $fullRoot))
+            }
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw (Get-RepairText -Key 'Repair.Error.TargetUnsafe' `
+                    -Arguments @($item.FullName))
+            }
+            if ($item -is [IO.DirectoryInfo]) {
+                $directories.Enqueue($item)
             }
             else {
                 $files.Add([IO.FileInfo]$item)
@@ -1405,250 +1444,6 @@ function Resolve-RepairComfyUIInstallTarget {
     Assert-RepairNoReparsePoint -Path $SourceRuntime
     Assert-RepairNoReparsePoint -Path $candidate
     return $candidate
-}
-function Get-RepairHash {
-    param([Parameter(Mandatory)][string]$Path)
-    Write-Verbose (Get-RepairText -Key 'Repair.Verbose.Hashing' `
-        -Arguments @($Path))
-    return (Get-FileHash -LiteralPath $Path `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
-}
-function Test-RepairFileHash {
-    param([string]$Path, [string]$ExpectedHash)
-    if ([string]::IsNullOrWhiteSpace($Path) -or
-        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $false
-    }
-    return (Get-RepairHash -Path $Path) -eq
-        $ExpectedHash.ToLowerInvariant()
-}
-function Set-RepairAtomicFile {
-    param(
-        [Parameter(Mandatory)][string]$TemporaryPath,
-        [Parameter(Mandatory)][string]$Destination,
-        [scriptblock]$MoveHandler,
-        [scriptblock]$RemoveHandler,
-        [scriptblock]$PathTester
-    )
-    if ($null -eq $MoveHandler) {
-        $MoveHandler = {
-            param([string]$Source, [string]$Target)
-            [IO.File]::Move($Source, $Target)
-        }
-    }
-    if ($null -eq $RemoveHandler) {
-        $RemoveHandler = {
-            param([string]$Path)
-            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-        }
-    }
-    if ($null -eq $PathTester) {
-        $PathTester = {
-            param([string]$Path)
-            Test-Path -LiteralPath $Path -PathType Leaf
-        }
-    }
-    if (-not [bool](& $PathTester $Destination)) {
-        & $MoveHandler $TemporaryPath $Destination
-        return
-    }
-    $backup = '{0}.winlama-{1}.backup' -f `
-        $Destination, [guid]::NewGuid().ToString('N')
-    & $MoveHandler $Destination $backup
-    try {
-        & $MoveHandler $TemporaryPath $Destination
-    }
-    catch {
-        $commitError = $_
-        try {
-            if ([bool](& $PathTester $Destination)) {
-                throw 'Basarisiz atomik tasima hedefte dosya birakti.'
-            }
-            if (-not [bool](& $PathTester $backup)) {
-                throw 'Atomik yedek dosyasi bulunamadi.'
-            }
-            & $MoveHandler $backup $Destination
-        }
-        catch {
-            $message = 'Atomik dosya geri yuklemesi basarisiz. ' +
-                "Korunan yedek: $backup | " +
-                "Yazma hatasi: $($commitError.Exception.Message) | " +
-                "Geri yukleme hatasi: $($_.Exception.Message)"
-            $restoreError = $_
-            $null = Invoke-RepairNoThrowNotification `
-                -Context 'ATOMIC_RESTORE_FAILED log bildirimi' `
-                -Action {
-                    Write-RepairLog -Event 'ATOMIC_RESTORE_FAILED' `
-                        -Message $message -Level ERROR `
-                        -Data @{ Destination = $Destination;
-                            Backup = $backup;
-                            CommitError = `
-                                $commitError.Exception.Message;
-                            RestoreError = `
-                                $restoreError.Exception.Message }
-                }
-            throw [IO.IOException]::new(
-                $message,
-                $restoreError.Exception
-            )
-        }
-        throw $commitError
-    }
-    try {
-        & $RemoveHandler $backup
-    }
-    catch {
-        $cleanupError = $_
-        $null = Invoke-RepairNoThrowNotification `
-            -Context 'ATOMIC_BACKUP_PRESERVED log bildirimi' `
-            -Action {
-                Write-RepairLog -Event 'ATOMIC_BACKUP_PRESERVED' `
-                    -Message (
-                        'Atomik yazma tamamlandi; ' +
-                        "yedek silinemedi: $backup"
-                    ) -Level WARN `
-                    -Data @{ Destination = $Destination;
-                        Backup = $backup;
-                        Error = $cleanupError.Exception.Message }
-            }
-    }
-}
-function Copy-RepairFile {
-    param(
-        [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination,
-        [Parameter(Mandatory)][string]$ExpectedHash
-    )
-    if (-not $PSCmdlet.ShouldProcess(
-        $Destination,
-        (Get-RepairText -Key 'Repair.Action.Copy')
-    )) {
-        return
-    }
-    [IO.Directory]::CreateDirectory(
-        (Split-Path -Parent $Destination)
-    ) | Out-Null
-    $temporaryPath = '{0}.winlama-{1}.tmp' -f `
-        $Destination, [guid]::NewGuid().ToString('N')
-    try {
-        Copy-Item -LiteralPath $Source `
-            -Destination $temporaryPath -Force
-        if ((Get-RepairHash -Path $temporaryPath) -ne
-            $ExpectedHash.ToLowerInvariant()) {
-            throw (Get-RepairText `
-                -Key 'Repair.Error.CopyHashMismatch' `
-                -Arguments @($Source, $Destination))
-        }
-        Set-RepairAtomicFile -TemporaryPath $temporaryPath `
-            -Destination $Destination
-        (Get-Item -LiteralPath $Destination).LastWriteTimeUtc = `
-            (Get-Item -LiteralPath $Source).LastWriteTimeUtc
-        $script:CopiedCount++
-        Write-RepairLog -Event 'FILE_COPIED' `
-            -Message (Get-RepairText `
-                -Key 'Repair.Log.FileCopied') `
-            -Data @{ Source = $Source; Destination = $Destination;
-                Sha256 = $ExpectedHash.ToLowerInvariant() }
-        Write-RepairStatus -Level SUCCESS -Message (Get-RepairText `
-            -Key 'Repair.File.Copied' -Arguments @($Destination))
-    }
-    finally {
-        Remove-Item -LiteralPath $temporaryPath -Force `
-            -ErrorAction SilentlyContinue
-    }
-}
-function Remove-RepairFile {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not $PSCmdlet.ShouldProcess(
-        $Path,
-        (Get-RepairText -Key 'Repair.Action.Delete')
-    )) {
-        return
-    }
-    Remove-Item -LiteralPath $Path -Force
-    $script:DeletedCount++
-    Write-RepairLog -Event 'FILE_DELETED' `
-        -Message (Get-RepairText `
-            -Key 'Repair.Log.ExtraRemoved') `
-        -Level WARN -Data @{ Path = $Path }
-    Write-RepairStatus -Level WARN -Message (Get-RepairText `
-        -Key 'Repair.File.Deleted' -Arguments @($Path))
-}
-function Sync-RepairFileSet {
-    param(
-        [Parameter(Mandatory)][string]$SourceBase,
-        [Parameter(Mandatory)][string]$TargetBase,
-        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()]
-        [IO.FileInfo[]]$SourceFiles,
-        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()]
-        [IO.FileInfo[]]$TargetFiles,
-        [switch]$Mirror
-    )
-    $sourceMap = @{}
-    foreach ($file in $SourceFiles) {
-        Assert-RepairSafeTreePath -Root $SourceBase `
-            -Path $file.FullName
-        $relativePath = Get-RepairRelativePath `
-            -Root $SourceBase -Path $file.FullName
-        $sourceMap[$relativePath] = $file
-        $destination = Join-Path $TargetBase $relativePath
-        Assert-RepairSafeTreePath -Root $TargetBase `
-            -Path $destination
-        $expectedHash = Get-RepairHash -Path $file.FullName
-        if (Test-Path -LiteralPath $destination -PathType Leaf) {
-            $targetFile = Get-Item -LiteralPath $destination
-            if ($targetFile.Length -eq $file.Length -and
-                (Get-RepairHash -Path $destination) -eq $expectedHash) {
-                $script:MatchedCount++
-                Write-Verbose (Get-RepairText `
-                    -Key 'Repair.Verbose.Match' `
-                    -Arguments @($destination))
-                continue
-            }
-        }
-        $script:DifferentCount++
-        Write-RepairStatus -Level STEP -Message (Get-RepairText `
-            -Key 'Repair.File.Different' -Arguments @($destination))
-        if ($Apply) {
-            Copy-RepairFile -Source $file.FullName `
-                -Destination $destination `
-                -ExpectedHash $expectedHash
-            if (-not $WhatIfPreference) {
-                $script:ResolvedCount++
-            }
-        }
-        else {
-            Add-RepairUnresolved -Message (Get-RepairText `
-                -Key 'Repair.Unresolved.File' `
-                -Arguments @($destination))
-        }
-    }
-    if (-not $Mirror) {
-        return
-    }
-    foreach ($file in $TargetFiles) {
-        Assert-RepairSafeTreePath -Root $TargetBase `
-            -Path $file.FullName
-        $relativePath = Get-RepairRelativePath `
-            -Root $TargetBase -Path $file.FullName
-        if ($sourceMap.ContainsKey($relativePath)) {
-            continue
-        }
-        $script:DifferentCount++
-        Write-RepairStatus -Level WARN -Message (Get-RepairText `
-            -Key 'Repair.File.Extra' -Arguments @($file.FullName))
-        if ($Apply) {
-            Remove-RepairFile -Path $file.FullName
-            if (-not $WhatIfPreference) {
-                $script:ResolvedCount++
-            }
-        }
-        else {
-            Add-RepairUnresolved -Message (Get-RepairText `
-                -Key 'Repair.Unresolved.File' `
-                -Arguments @($file.FullName))
-        }
-    }
 }
 function Test-RepairComfyUIRuntimeLayout {
     param([Parameter(Mandatory)][string]$Path)
@@ -2138,7 +1933,6 @@ function Sync-RepairApplicationPayload {
     param(
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Target,
-        [pscustomobject]$RuntimeConfig,
         [switch]$PackageTarget,
         [switch]$Execute,
         [scriptblock]$ApplicationFileProvider,
@@ -2279,11 +2073,6 @@ function Sync-RepairApplicationPayload {
         Add-RepairSkipped -Message $message
         Add-RepairUnresolved -Message $message
     }
-    if ($PackageTarget) {
-        Sync-RepairTree -Source (Join-Path $Source 'Runtime\ComfyUI') `
-            -Target (Join-Path $Target 'Runtime\ComfyUI') `
-            -Optional -RuntimePayload -RuntimeConfig $RuntimeConfig
-    }
 }
 function Sync-RepairCanonicalPackageConfig {
     param(
@@ -2321,16 +2110,6 @@ function Sync-RepairCanonicalPackageConfig {
     }
 }
 function Assert-RepairApplicationSafetyContract {
-    foreach ($relativePath in @(
-        'Data\Configs\config.json',
-        'Data\Configs\openui-config.json'
-    )) {
-        $configurationPath = Join-Path $PSScriptRoot $relativePath
-        if (-not (Test-RepairManagedConfigurationSafe `
-            -Path $configurationPath)) {
-            throw "Yonetilen kaynak yapilandirma guvenli degil: $relativePath"
-        }
-    }
     $safeConfiguration = [pscustomobject]@{
         Services = @(
             [pscustomobject]@{
@@ -4262,10 +4041,10 @@ function Assert-RepairOllamaApplicationContract {
             'http://127.0.0.1:11435/api/version' -or
         $wildcardHostUri.AbsoluteUri -cne
             'http://127.0.0.1:33445/api/version' -or
-        $wildcardIpv6HostUri.AbsoluteUri -cne (
-            'http://[0000:0000:0000:0000:0000:0000:0000:0001]:' +
-            '33446/api/version'
-        ) -or
+        -not $wildcardIpv6HostUri.IsLoopback -or
+        $wildcardIpv6HostUri.HostNameType -ne [UriHostNameType]::IPv6 -or
+        $wildcardIpv6HostUri.Port -ne 33446 -or
+        $wildcardIpv6HostUri.AbsolutePath -cne '/api/version' -or
         -not $boundedTimeoutRejected -or
         -not $treeTerminated.Value -or
         -not $boundedProcess.Disposed -or
@@ -4796,6 +4575,28 @@ function Repair-OllamaPackages {
         }
     }
 }
+function Invoke-RepairInstalledComfyUIScope {
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$InstalledRoot,
+        [Parameter(Mandatory)][pscustomobject]$Config,
+        [Parameter(Mandatory)][string]$ModelDirection,
+        [switch]$AuditOnly
+    )
+    if (-not (Test-RepairConfigurationComponentEnabled `
+        -Config $Config -Component 'ComfyUI')) {
+        return
+    }
+    $sourceRuntime = Join-Path $SourceRoot 'Runtime\ComfyUI'
+    $targetRuntime = Resolve-RepairComfyUIInstallTarget `
+        -Config $Config -InstalledRoot $InstalledRoot `
+        -SourceRuntime $sourceRuntime
+    Sync-RepairTree -Source $sourceRuntime -Target $targetRuntime `
+        -Optional -RuntimePayload -InstalledRuntimeTarget `
+        -RuntimeConfig $Config
+    Repair-ComfyUIAssets -PackageRoot $SourceRoot -Config $Config `
+        -Direction $ModelDirection -AuditOnly:$AuditOnly
+}
 function Invoke-RepairPostValidation {
     param(
         [Parameter(Mandatory)][string]$SourceRoot,
@@ -4808,7 +4609,8 @@ function Invoke-RepairPostValidation {
         [ValidateSet(
             'PackageToInstalled', 'InstalledToPackage', 'Bidirectional'
         )]
-        [string]$ModelDirection
+        [string]$ModelDirection,
+        [string]$DiskTarget
     )
     $detected = $script:DifferentCount
     $matched = $script:MatchedCount
@@ -4826,15 +4628,8 @@ function Invoke-RepairPostValidation {
     $script:Apply = $false
     try {
         if ($SelectedMode -eq 'PublishPackage') {
-            Sync-RepairApplicationPayload -Source $SourceRoot `
-                -Target $TargetRoot -RuntimeConfig $Config `
-                -PackageTarget
-            Sync-RepairCanonicalPackageConfig -Source $SourceRoot `
-                -Target $TargetRoot
-            Repair-ComfyUIAssets -PackageRoot $TargetRoot `
-                -Config $Config -Direction InstalledToPackage
-            Repair-OllamaPackages -PackageRoot $TargetRoot `
-                -Config $Config -Direction InstalledToPackage
+            Invoke-RepairDiskScope -Source $SourceRoot -Target $TargetRoot `
+                -Config $Config
         }
         else {
             Sync-RepairApplicationPayload -Source $SourceRoot `
@@ -4844,18 +4639,15 @@ function Invoke-RepairPostValidation {
                     -PackageRoot $SourceRoot `
                     -InstalledRoot $TargetRoot `
                     -PackageConfig $Config
-            $comfyInstall = Resolve-RepairComfyUIInstallTarget `
-                -Config $installedConfig -InstalledRoot $TargetRoot `
-                -SourceRuntime (Join-Path $SourceRoot `
-                    'Runtime\ComfyUI')
-            Sync-RepairTree -Source (Join-Path $SourceRoot `
-                'Runtime\ComfyUI') -Target $comfyInstall `
-                -Optional -RuntimePayload -InstalledRuntimeTarget `
-                -RuntimeConfig $Config
-            Repair-ComfyUIAssets -PackageRoot $SourceRoot `
-                -Config $Config -Direction $ModelDirection
+            Invoke-RepairInstalledComfyUIScope -SourceRoot $SourceRoot `
+                -InstalledRoot $TargetRoot -Config $installedConfig `
+                -ModelDirection $ModelDirection
             Repair-OllamaPackages -PackageRoot $SourceRoot `
                 -Config $Config -Direction $ModelDirection
+        }
+        if ($DiskTarget) {
+            Invoke-RepairDiskScope -Source $SourceRoot -Target $DiskTarget `
+                -Config $Config
         }
         $remaining = $script:DifferentCount
         $validationUnresolved = @($script:UnresolvedItems)
@@ -6871,8 +6663,13 @@ function Select-RepairMode {
 }
 $exitCode = 0
 try {
+    . (Join-Path $PSScriptRoot 'Modules\Repair\DiskScope.ps1')
     $ConfigPath = Resolve-RepairConfigPath -Path $ConfigPath
     Initialize-RepairLocalization -Path $ConfigPath
+    if ($Preview -and ($Apply -or $GenerateReport -or $Mode -eq 'Menu' -or
+        ($Mode -eq 'PublishPackage' -and -not $DestinationRoot))) {
+        throw (Get-RepairText -Key 'Repair.Error.PreviewConflict')
+    }
     Initialize-RepairCommon
     Write-Verbose (Get-RepairText `
         -Key 'Repair.Verbose.ValidationStarted')
@@ -6912,7 +6709,7 @@ try {
         -AuditPrefixes $auditModelPrefixes `
         -Root $PSScriptRoot
     Assert-RepairComfyUIRuntimeContracts -Config $localConfig
-    if (-not $ValidateOnly) {
+    if (-not $ValidateOnly -and -not $Preview) {
         $deploymentRoot = Resolve-RepairPath `
             -Path ([string]$localConfig.Paths.Root) `
             -BasePath $PSScriptRoot
@@ -7028,20 +6825,44 @@ try {
     }
     $executionPolicy = Get-RepairExecutionPolicy `
         -SelectedMode $selectedMode
-    $packageRoot = Select-RepairPackageRoot `
-        -RequestedRoot $SourceRoot
+    $nonInteractive = $Preview -or ($NoPause -and $Mode -ne 'Menu')
+    $installation = $localConfig.PSObject.Properties['Installation']
+    $recordedRoot = if ($null -ne $installation -and $null -ne $installation.Value) {
+        $recordedSource = $installation.Value.PSObject.Properties['Source']
+        if ($null -ne $recordedSource) {
+            [string]$recordedSource.Value
+        }
+    }
+    $packageRoot = Select-RepairPackageRoot -RequestedRoot $SourceRoot `
+        -RecordedRoot $recordedRoot `
+        -AllowPathInput:($Mode -eq 'Menu' -and -not $Preview) `
+        -NonInteractive:$nonInteractive
     $script:RepairMode = $selectedMode
     $script:RepairSource = $packageRoot
     $packageConfigPath = Resolve-RepairConfigPath -Root $packageRoot
     $packageConfig = Get-Content -LiteralPath $packageConfigPath `
         -Raw -Encoding UTF8 | ConvertFrom-RepairJson
+    if (-not (Test-RepairManagedConfigurationSafe -Path $packageConfigPath)) {
+        throw (Get-RepairText -Key 'Repair.Error.ConfigInvalid' `
+            -Arguments @($packageConfigPath))
+    }
     Assert-RepairCanonicalModelPaths -Config $packageConfig `
         -PackageRoot $packageRoot
     Assert-RepairModelCatalog -Config $packageConfig `
         -OfficialPrefixes $officialModelPrefixes `
         -AuditPrefixes $auditModelPrefixes `
         -Root $packageRoot
-    if (-not $Apply) {
+    $targets = Get-RepairTargets -SelectedMode $selectedMode `
+        -SourceRoot $packageRoot -DestinationRoot $DestinationRoot `
+        -Config $packageConfig -NonInteractive:$nonInteractive
+    $script:RepairTarget = $targets.Primary
+    Write-RepairStatus -Level INFO -Message (Get-RepairText `
+        -Key 'Repair.Target.Selected' -Arguments @($targets.Primary))
+    if ($targets.Disk) {
+        Write-RepairStatus -Level INFO -Message (Get-RepairText `
+            -Key 'Repair.Target.Selected' -Arguments @($targets.Disk))
+    }
+    if (-not $Apply -and -not $nonInteractive -and -not $WhatIfPreference) {
         $Apply = Confirm-RepairAction -Prompt (Get-RepairText `
             -Key 'Repair.Prompt.Apply')
     }
@@ -7060,43 +6881,22 @@ try {
         -Key $modeKey)
     Write-RepairStatus -Level INFO -Message (Get-RepairText `
         -Key 'Repair.Source.Selected' -Arguments @($packageRoot))
-    $postValidationTarget = $null
-    if ($selectedMode -eq 'PublishPackage') {
-        $destination = Resolve-RepairDestinationRoot `
-            -RequestedRoot $DestinationRoot
-        if ($packageRoot -ieq $destination) {
-            throw (Get-RepairText -Key 'Repair.Error.SameRoot')
-        }
-        Write-RepairStatus -Level INFO -Message (Get-RepairText `
-            -Key 'Repair.Target.Selected' -Arguments @($destination))
-        $script:RepairTarget = $destination
-        $postValidationTarget = $destination
-        Write-RepairLog -Event 'TARGET_SELECTED' `
-            -Message (Get-RepairText `
-                -Key 'Repair.Log.PublishTargetSelected') `
-            -Data @{ Target = $destination }
-        Sync-RepairApplicationPayload -Source $packageRoot `
-            -Target $destination -RuntimeConfig $packageConfig `
-            -PackageTarget -Execute:$Apply
-        Sync-RepairCanonicalPackageConfig -Source $packageRoot `
-            -Target $destination -Execute:$Apply
-        Repair-ComfyUIAssets -PackageRoot $destination `
-            -Config $packageConfig -Direction InstalledToPackage
-        Repair-OllamaPackages -PackageRoot $destination `
-            -Config $packageConfig -Direction InstalledToPackage
+    $targetEvent = if ($selectedMode -eq 'PublishPackage') {
+        'Repair.Log.PublishTargetSelected'
     }
     else {
-        $installedRoot = Resolve-RepairPath `
-            -Path ([string]$packageConfig.Paths.Root) `
-            -BasePath $packageRoot
-        Assert-RepairDestination -Path $installedRoot
-        if ($packageRoot -ieq $installedRoot) {
-            throw (Get-RepairText -Key 'Repair.Error.SameRoot')
-        }
-        Write-RepairStatus -Level INFO -Message (Get-RepairText `
-            -Key 'Repair.Target.Selected' -Arguments @($installedRoot))
-        $script:RepairTarget = $installedRoot
-        $postValidationTarget = $installedRoot
+        'Repair.Log.InstalledTargetSelected'
+    }
+    Write-RepairLog -Event 'TARGET_SELECTED' -Message (Get-RepairText -Key $targetEvent) `
+        -Data @{ Target = $targets.Primary; DiskTarget = $targets.Disk }
+    $postValidationTarget = $targets.Primary
+    $diskTarget = $targets.Disk
+    if ($selectedMode -eq 'PublishPackage') {
+        Invoke-RepairDiskScope -Source $packageRoot -Target $targets.Primary `
+            -Config $packageConfig -Execute:$Apply
+    }
+    else {
+        $installedRoot = $targets.Primary
         $installedConfig = Repair-RepairInstalledConfiguration `
             -PackageRoot $packageRoot `
             -InstalledRoot $installedRoot `
@@ -7108,17 +6908,9 @@ try {
             -Data @{ Target = $installedRoot }
         Sync-RepairApplicationPayload -Source $packageRoot `
             -Target $installedRoot -Execute:$Apply
-        $comfyInstall = Resolve-RepairComfyUIInstallTarget `
-            -Config $installedConfig -InstalledRoot $installedRoot `
-            -SourceRuntime (Join-Path $packageRoot `
-                'Runtime\ComfyUI')
-        Sync-RepairTree -Source (Join-Path $packageRoot `
-            'Runtime\ComfyUI') -Target $comfyInstall `
-            -Optional -RuntimePayload -InstalledRuntimeTarget `
-            -RuntimeConfig $packageConfig
-        Repair-ComfyUIAssets -PackageRoot $packageRoot `
-            -Config $packageConfig `
-            -Direction $executionPolicy.ModelDirection `
+        Invoke-RepairInstalledComfyUIScope -SourceRoot $packageRoot `
+            -InstalledRoot $installedRoot -Config $installedConfig `
+            -ModelDirection $executionPolicy.ModelDirection `
             -AuditOnly:$executionPolicy.ModelAuditOnly
         Repair-OllamaPackages -PackageRoot $packageRoot `
             -Config $packageConfig `
@@ -7131,12 +6923,17 @@ try {
                     -Config $installedConfig
             }
         }
+        if ($diskTarget) {
+            Invoke-RepairDiskScope -Source $packageRoot -Target $diskTarget `
+                -Config $packageConfig -Execute:$Apply
+        }
     }
     if ($Apply -and -not $WhatIfPreference) {
         Invoke-RepairPostValidation -SourceRoot $packageRoot `
             -TargetRoot $postValidationTarget -Config $packageConfig `
             -SelectedMode $selectedMode `
-            -ModelDirection $executionPolicy.ModelDirection
+            -ModelDirection $executionPolicy.ModelDirection `
+            -DiskTarget $diskTarget
     }
     else {
         $script:ResolvedCount = 0
@@ -7194,7 +6991,7 @@ catch {
     $exitCode = 1
     $message = $_.Exception.Message
     Add-RepairFailure -Message $message
-    if (-not $ValidateOnly -and [string]::IsNullOrWhiteSpace(
+    if (-not $ValidateOnly -and -not $Preview -and [string]::IsNullOrWhiteSpace(
         $script:RepairLogPath
     )) {
         Initialize-RepairFallbackDiagnostics
@@ -7240,7 +7037,7 @@ catch {
         -Key 'Repair.Report.Failed' `
         -Arguments @($reportError))
 }
-if (-not $NoPause -and -not $ValidateOnly) {
+if (-not $NoPause -and -not $ValidateOnly -and -not $Preview) {
     $completion = if ($exitCode -eq 0) {
         [pscustomobject]@{
             Key = 'Repair.Operation.Completed'

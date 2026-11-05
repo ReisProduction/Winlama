@@ -91,7 +91,7 @@ function Assert-EngineStateJsonContracts {
     $context = [pscustomobject]@{
         MachineId = 'fixture-machine'
         SessionId = 'fixture-session'
-        Config = [pscustomobject]@{ EngineVersion = '26.8.6' }
+        Config = [pscustomobject]@{ EngineVersion = '26.10.29' }
     }
     $fixture = New-EngineState -Context $context
     $fixture.InstallSessionID = 'fixture-session'
@@ -105,7 +105,7 @@ function Assert-EngineStateJsonContracts {
     $foreignContext = [pscustomobject]@{
         MachineId = 'fixture-machine'
         SessionId = 'different-session'
-        Config = [pscustomobject]@{ EngineVersion = '26.8.6' }
+        Config = [pscustomobject]@{ EngineVersion = '26.10.29' }
     }
     if ($state.StartedAt -isnot [string] -or
         [string]$state.StartedAt -cne $dateText -or

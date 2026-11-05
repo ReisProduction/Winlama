@@ -422,7 +422,7 @@ function Initialize-UninstallLocalization {
 function Get-UninstallText {
     param(
         [Parameter(Mandatory)][string]$Key,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Fallback,
+        [AllowEmptyString()][string]$Fallback = $Key,
         [object[]]$Arguments = @()
     )
     $text = $Fallback
@@ -1252,7 +1252,7 @@ function Resolve-SafeUninstallPath {
     }
     $fullPath = [IO.Path]::GetFullPath($expanded).TrimEnd('\')
     if ([string]::IsNullOrWhiteSpace($fullPath) -or
-        $fullPath -match '^[A-Za-z]:$') {
+        $fullPath -cmatch '^[A-Za-z]:$') {
         throw "Genis kaldirma yolu reddedildi: $fullPath"
     }
     foreach ($broad in @(Get-UninstallBroadPaths)) {
@@ -2976,7 +2976,7 @@ function Test-UninstallNodeRootAllowed {
     param([Parameter(Mandatory)][string]$Root)
     try {
         $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
-        if ($fullRoot -notmatch '^[A-Za-z]:\\') {
+        if ($fullRoot -cnotmatch '^[A-Za-z]:\\') {
             return $false
         }
         return @(
@@ -3189,6 +3189,9 @@ function Get-NodeRuntimeCandidateRoots {
         (Join-Path $env:LOCALAPPDATA 'nvm')
     )
     foreach ($base in $nvmBases) {
+        if ([string]::IsNullOrWhiteSpace($base)) {
+            continue
+        }
         if (-not (Test-Path -LiteralPath $base -PathType Container)) {
             continue
         }
@@ -3205,6 +3208,9 @@ function Get-NodeRuntimeCandidateRoots {
         (Join-Path $env:APPDATA 'fnm')
     )
     foreach ($base in $fnmBases) {
+        if ([string]::IsNullOrWhiteSpace($base)) {
+            continue
+        }
         $versions = Join-Path $base 'node-versions'
         if (-not (Test-Path -LiteralPath $versions `
             -PathType Container)) {
@@ -3223,6 +3229,9 @@ function Get-NodeRuntimeCandidateRoots {
         (Join-Path $env:LOCALAPPDATA 'Volta')
     )
     foreach ($base in $voltaBases) {
+        if ([string]::IsNullOrWhiteSpace($base)) {
+            continue
+        }
         $images = Join-Path $base 'tools\image\node'
         if (-not (Test-Path -LiteralPath $images `
             -PathType Container)) {
@@ -4227,7 +4236,12 @@ function Complete-CleanupOperation {
     }
     Write-CleanupRule -Character '=' `
         -Color $ruleColor
-    Wait-CleanupExit -InputReader $InputReader
+    try {
+        Wait-CleanupExit -InputReader $InputReader
+    }
+    catch [IO.EndOfStreamException] {
+        return
+    }
 }
 try {
     $Host.UI.RawUI.WindowTitle = '__WINLAMA_CLEANUP_WINDOW_TITLE__'
@@ -4910,168 +4924,7 @@ function Resolve-UninstallIndexSelection {
         Selection = @($selection)
     }
 }
-function Get-UninstallMenuItems {
-    return @(
-        [pscustomobject]@{
-            Choice = '1'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.Full' `
-                -Fallback '[1] Winlama bilesenlerini tamamen kaldir'
-            Color = 'Red'
-        },
-        [pscustomobject]@{
-            Choice = '2'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.ComfyUI' `
-                -Fallback '[2] ComfyUI ve modellerini kaldir'
-            Color = 'Magenta'
-        },
-        [pscustomobject]@{
-            Choice = '3'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.WebUI' `
-                -Fallback '[3] Open WebUI verilerini kaldir'
-            Color = 'Cyan'
-        },
-        [pscustomobject]@{
-            Choice = '4'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.Ollama' `
-                -Fallback '[4] Ollama uygulamasini kaldir'
-            Color = 'Yellow'
-        },
-        [pscustomobject]@{
-            Choice = '5'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.DeveloperCli' `
-                -Fallback '[5] Codex ve GitHub Copilot CLI kaldir'
-            Color = 'Magenta'
-        },
-        [pscustomobject]@{
-            Choice = '6'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.Models' `
-                -Fallback '[6] Model yoneticisini ac'
-            Color = 'Green'
-        },
-        [pscustomobject]@{
-            Choice = '0'
-            Text = Get-UninstallText -Key 'Uninstall.Menu.Back' `
-                -Fallback '[0] Launcher menusune don'
-            Color = 'Gray'
-        }
-    )
-}
-function Show-UninstallMenu {
-    Write-UninstallBootstrapRule -Character '='
-    Write-UninstallBootstrapLine `
-        -Text (Get-UninstallText -Key 'Uninstall.Banner.Title' `
-            -Fallback 'WINLAMA KALDIRMA YONETICISI') -Color Cyan
-    Write-UninstallBootstrapLine `
-        -Text (Get-UninstallText -Key 'Uninstall.Banner.Summary' `
-            -Fallback ('Bilesenleri ayri ayri veya tamamen ' +
-                'kaldirabilirsiniz')) `
-        -Color Cyan
-    Write-UninstallBootstrapRule -Character '='
-    foreach ($item in @(Get-UninstallMenuItems)) {
-        Write-UninstallBootstrapLine -Text $item.Text -Color $item.Color
-    }
-    Write-UninstallBootstrapRule
-}
-function Get-FullUninstallSelectionItems {
-    return @(
-        [pscustomobject]@{
-            Index = 1
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.ComfyUI' `
-                -Fallback '[1] ComfyUI ve ComfyUI modelleri'
-            Color = 'Magenta'
-        },
-        [pscustomobject]@{
-            Index = 2
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.WebUI' `
-                -Fallback '[2] Open WebUI verileri ve ayarlari'
-            Color = 'Cyan'
-        },
-        [pscustomobject]@{
-            Index = 3
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.Ollama' `
-                -Fallback '[3] Ollama uygulamasi'
-            Color = 'Yellow'
-        },
-        [pscustomobject]@{
-            Index = 4
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.OllamaModels' `
-                -Fallback '[4] Ollama modelleri'
-            Color = 'Green'
-        },
-        [pscustomobject]@{
-            Index = 5
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.PythonLibraries' `
-                -Fallback '[5] Winlama Python kutuphaneleri'
-            Color = 'Cyan'
-        },
-        [pscustomobject]@{
-            Index = 6
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.Python' `
-                -Fallback '[6] Winlama Python 3.11'
-            Color = 'Red'
-        },
-        [pscustomobject]@{
-            Index = 7
-            Text = Get-UninstallText `
-                -Key 'Uninstall.FullSelection.DeveloperCli' `
-                -Fallback '[7] Codex ve GitHub Copilot CLI'
-            Color = 'Magenta'
-        }
-    )
-}
-function Show-FullUninstallSelection {
-    Write-UninstallBootstrapRule
-    Write-UninstallBootstrapLine `
-        -Text (Get-UninstallText `
-            -Key 'Uninstall.FullSelection.Title' `
-            -Fallback 'Silinecek istege bagli bilesenleri secin:') `
-        -Color Cyan
-    foreach ($item in @(Get-FullUninstallSelectionItems)) {
-        Write-UninstallBootstrapLine -Text $item.Text -Color $item.Color
-    }
-    Write-UninstallBootstrapLine -Text (Get-UninstallText `
-        -Key 'Uninstall.FullSelection.Instruction' `
-        -Fallback ('A tumunu secer. 1,2 secilenleri siler. ' +
-            '-1,2 secilenleri korur. 0/S iptal eder.')) `
-        -Color Yellow
-    Write-UninstallBootstrapRule
-}
-function Read-FullUninstallSelection {
-    param(
-        [AllowNull()][string]$Value,
-        [scriptblock]$InputReader
-    )
-    if ($PSBoundParameters.ContainsKey('Value')) {
-        return Resolve-UninstallIndexSelection -Value $Value
-    }
-    Show-FullUninstallSelection
-    while ($true) {
-        $Value = Read-UninstallInput `
-            -Prompt (Get-UninstallText `
-                -Key 'Uninstall.FullSelection.SelectionPrompt' `
-                -Fallback ('Bilesenleri secin. Bos giris reddedilir; ' +
-                    'silme yalniz ikinci EVET onayiyla baslar.')) `
-            -Label (Get-UninstallText `
-                -Key 'Uninstall.FullSelection.Prompt' `
-                -Fallback ('Se{0}iminiz' -f [char]0x00E7)) `
-                -InputReader $InputReader
-        try {
-            return Resolve-UninstallIndexSelection -Value $Value
-        }
-        catch {
-            Write-UninstallBootstrapStatus -Level WARN `
-                -Message (Get-UninstallText `
-                    -Key 'Uninstall.FullSelection.Invalid' `
-                    -Fallback 'Gecersiz secim; yeniden deneyin.')
-        }
-    }
-}
+. (Join-Path $PSScriptRoot 'Modules\Uninstall\Menu.ps1')
 function Get-FullUninstallActions {
     param(
         [Parameter(Mandatory)][pscustomobject]$Config,
@@ -5343,7 +5196,7 @@ function Complete-UninstallMenuAction {
 }
 function Invoke-UninstallMenu {
     param([Parameter(Mandatory)][pscustomobject]$Config)
-    while ($true) {
+    :uninstallMenu while ($true) {
         try {
             Clear-Host
         }
@@ -5430,7 +5283,7 @@ function Invoke-UninstallMenu {
                         -Key 'Common.Selection.Invalid' `
                         -Fallback ('Gecersiz secim. Hicbir sey ' +
                             'silinmedi.'))
-                continue
+                continue uninstallMenu
             }
         }
         if ($status -eq 'Failed') {
@@ -6506,6 +6359,10 @@ if (-not $fixtureEofRejected -or
     (ConvertFrom-CleanupReadValue -Value '') -cne '') {
     throw 'Harici temizlik EOF girdi sozlesmesi gecersiz.'
 }
+Complete-CleanupOperation -Level SUCCESS `
+    -Message 'Kok temizligi EOF tamamlanma fiksturu.' `
+    -InputReader { $null }
+Write-Verbose 'WINLAMA_UI_OK:Uninstall.CleanupClosedInput'
 $fixtureKeep = 'C:\Fixture\Winlama\Dependencies\Python311'
 if (-not (Test-CleanupPayloadPathAllowed `
         -ItemPath 'C:\Fixture\Winlama\Dependencies' `

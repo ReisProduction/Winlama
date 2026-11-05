@@ -18,7 +18,7 @@ param(
     [string]$DefaultConfigSelection = 'Prompt',
     [ValidateSet('Prompt', 'Install', 'Skip')]
     [string]$VoiceSelection = 'Prompt',
-    [ValidateSet('Prompt', 'Turkish', 'English')]
+    [ValidateSet('Prompt', 'Turkish', 'English', 'Both')]
     [string]$VoiceLanguageSelection = 'Prompt',
     [ValidateSet('Prompt', 'Local', 'Online', 'Automatic')]
     [string]$OllamaSourceSelection = 'Prompt',
@@ -39,9 +39,10 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:InstallerRequestedConfigPath = $ConfigPath
 $script:InstallerConfigPathWasExplicit =
     -not [string]::IsNullOrWhiteSpace($ConfigPath)
+$script:InstallerSessionIdWasExplicit =
+    -not [string]::IsNullOrWhiteSpace($SessionId)
 $script:InstallerJsonSupportsDateKind =
     (Get-Command ConvertFrom-Json -ErrorAction Stop).
         Parameters.ContainsKey('DateKind')
@@ -503,15 +504,31 @@ function Assert-InstallerResumeConfigHandoff {
         [string]::IsNullOrWhiteSpace($RequestedConfigPath) -or
         -not (Test-Path -LiteralPath $RequestedConfigPath -PathType Leaf)) {
         throw [IO.InvalidDataException]::new(
-            (Get-LocalizedText `
-                -Key 'Installer.Error.ResumeConfigRequired')
+            (Get-InstallerBootstrapText `
+                -Key 'Installer.Error.ResumeConfigRequired' `
+                -Fallback ('Resume icin onceki etkin config ' +
+                    'dosyasinin yolu -ConfigPath ile verilmelidir.'))
         )
     }
 }
 Assert-InstallerResumeConfigHandoff `
     -ResumeRequested ([bool]$Resume) `
     -ConfigPathWasExplicit $script:InstallerConfigPathWasExplicit `
-    -RequestedConfigPath $script:InstallerRequestedConfigPath
+    -RequestedConfigPath $ConfigPath
+if ($Resume -and -not $script:InstallerSessionIdWasExplicit -and
+    $null -ne $script:InstallerConfiguration) {
+    $installation = $script:InstallerConfiguration.PSObject.Properties[
+        'Installation'
+    ]
+    if ($null -ne $installation -and $null -ne $installation.Value) {
+        $savedSession = $installation.Value.PSObject.Properties['SessionId']
+        if ($null -ne $savedSession -and
+            -not [string]::IsNullOrWhiteSpace([string]$savedSession.Value)) {
+            $SessionId = Resolve-InstallerSessionId `
+                -Value ([string]$savedSession.Value)
+        }
+    }
+}
 function Resolve-InstallerPath {
     param([Parameter(Mandatory)][string]$Path)
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
@@ -1440,7 +1457,7 @@ function Test-InstallerPackageRootBootstrapIdentity {
         $operationalFiles = @(
             Assert-ApplicationSourcePayload -SourceRoot $resolved
         )
-        if ($operationalFiles.Count -ne 36) {
+        if ($operationalFiles.Count -ne 43) {
             throw ('Operasyonel payload dosya sayisi gecersiz: ' +
                 $operationalFiles.Count)
         }
@@ -2659,7 +2676,7 @@ function Show-InstallerLocalizedInputValidation {
         if (-not $keys.Add($key)) {
             throw "Yinelenen yerellestirme anahtari: $key"
         }
-        if ($value -match '[^\x00-\x7F]' -and
+        if ($value -cmatch '[^\x00-\x7F]' -and
             ($key -notin $selectionKeys -or
                 $value -cne $selectionText)) {
             throw "ASCII olmayan yerellestirme metni: $key"
@@ -3048,7 +3065,7 @@ function Get-InstallerLogEventCode {
 function Write-InstallerLog {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('INFO', 'WARN', 'ERROR')]
+        [ValidateSet('INFO', 'STEP', 'WARN', 'ERROR')]
         [string]$Level,
         [Parameter(Mandatory)]
         [string]$Message,
@@ -3066,13 +3083,15 @@ function Write-InstallerLog {
         $exceptionText = ConvertTo-InstallerDiagnosticText `
             -Value $Exception.ToString() -MaximumLength 2048
     }
-    $entry = New-InstallerLogRecord -Level $Level `
+    $recordLevel = if ($Level -eq 'STEP') { 'INFO' } else { $Level }
+    $entry = New-InstallerLogRecord -Level $recordLevel `
         -Message $Message -ExceptionText $exceptionText `
         -EventCode $EventCode
     $line = $entry | ConvertTo-Json -Compress
     $uiLevel = switch ($Level) {
         'ERROR' { 'ERROR' }
         'WARN' { 'WARN' }
+        'STEP' { 'STEP' }
         default { 'INFO' }
     }
     if ($ValidateOnly) {
@@ -4914,12 +4933,6 @@ function Save-EffectiveInstallerConfig {
         $Config.ComfyUI.$name = Resolve-InstallerPath `
             -Path $Config.ComfyUI.$name
     }
-    $Config.ComfyUI.OutputPath = `
-        '%TEMP%\Winlama\ComfyUI\output'
-    $Config.ComfyUI.InputPath = `
-        '%TEMP%\Winlama\ComfyUI\input'
-    $Config.ComfyUI.TempPath = `
-        '%TEMP%\Winlama\ComfyUI\temp'
     $tempPath = Resolve-InstallerPath -Path $Config.Paths.Temp
     $path = Join-Path $tempPath 'effective-config.json'
     [IO.Directory]::CreateDirectory($tempPath) | Out-Null
@@ -6946,7 +6959,7 @@ function Install-InstallerComfyUIRuntime {
                 [Net.SecurityProtocolType]::Tls12
             $headers = @{
                 Accept = 'application/vnd.github+json'
-                'User-Agent' = 'Winlama-26.8.6'
+                'User-Agent' = 'Winlama-26.10.29'
                 'X-GitHub-Api-Version' = '2022-11-28'
             }
             $timeout = [int]$Config.Network.DownloadTimeoutSeconds
@@ -6968,9 +6981,9 @@ function Install-InstallerComfyUIRuntime {
                 try {
                     Remove-Item -LiteralPath $archive -Force `
                         -ErrorAction SilentlyContinue
-                    Invoke-WebRequest -Uri $downloadUri.AbsoluteUri `
+                    Save-WinlamaWebFile -Uri $downloadUri `
                         -Headers $headers -OutFile $archive `
-                        -UseBasicParsing -TimeoutSec $timeout
+                        -TimeoutSec $timeout
                     $downloaded = $true
                     break
                 }
@@ -7149,10 +7162,6 @@ function Install-InstallerComfyUIRuntime {
         if (Test-Path -LiteralPath $destination -PathType Container) {
             Write-InstallerLog -Level STEP `
                 -Message 'Installer.ComfyUI.RuntimeStopping'
-            Write-WinlamaUIStatus -Level STEP -Message (
-                Get-LocalizedText `
-                    -Key 'Installer.ComfyUI.RuntimeStopping'
-            )
             Stop-ProcessesFromPath -RootPath $destination
             foreach ($relativePath in @(
                 'ComfyUI\custom_nodes', 'ComfyUI\user',
@@ -7238,10 +7247,6 @@ function Install-InstallerComfyUIRuntime {
             )
         Write-InstallerLog -Level STEP `
             -Message 'Installer.ComfyUI.ModelPreservationVerifying'
-        Write-WinlamaUIStatus -Level STEP -Message (
-            Get-LocalizedText `
-                -Key 'Installer.ComfyUI.ModelPreservationVerifying'
-        )
         $null = Assert-InstallerComfyUIEmbeddedModelsPreserved `
             -Config $Config `
             -ProjectRoot $script:InstallerPackageRoot
@@ -9580,13 +9585,17 @@ function New-InstallerPendingPayloadConfiguration {
     )
     $pending = $Config | ConvertTo-Json -Depth 100 |
         ConvertFrom-InstallerJson
-    $pending.Models.Requested = @($OllamaModelNames)
-    if ($OllamaModelNames.Count -eq 0) {
+    $pending.Models.Requested = @($OllamaModelNames | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_)
+    })
+    if ($pending.Models.Requested.Count -eq 0) {
         $pending.Models.LocalPackageImport.SelectedPackages = @()
         $pending.Models | Add-Member -NotePropertyName InstallSource `
             -NotePropertyValue Automatic -Force
     }
-    $pending.ComfyUI.Requested = @($ComfyUIModels | ForEach-Object {
+    $pending.ComfyUI.Requested = @($ComfyUIModels | Where-Object {
+        $null -ne $_
+    } | ForEach-Object {
         [string]$_.Name
     })
     $nodeModels = if ($PSBoundParameters.ContainsKey(
@@ -9599,7 +9608,9 @@ function New-InstallerPendingPayloadConfiguration {
     }
     $pending.ComfyUI | Add-Member `
         -NotePropertyName PendingRequiredNodeModels `
-        -NotePropertyValue @($nodeModels | ForEach-Object {
+        -NotePropertyValue @($nodeModels | Where-Object {
+            $null -ne $_
+        } | ForEach-Object {
             [string]$_.Name
         }) -Force
     return $pending
@@ -9624,37 +9635,7 @@ function Get-InstallerRetainedComfyUIModels {
     }
     return @()
 }
-function Test-InstallerVoiceModelCache {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Config,
-        [scriptblock]$FileProbe
-    )
-    $model = [string]$Config.Voice.Model
-    $revision = [string]$Config.Voice.Revision
-    if ($model -notmatch '^[a-z0-9._-]+/[a-z0-9._-]+$' -or
-        $revision -notmatch '^[a-f0-9]{40}$') {
-        return $false
-    }
-    $cacheName = $model.Split('/')[-1]
-    $repositoryName = 'models--{0}' -f $model.Replace('/', '--')
-    $dataRoot = Resolve-InstallerDeploymentPath -Config $Config `
-        -Path ([string]$Config.Paths.Data)
-    $snapshot = Join-Path $dataRoot `
-        "cache\huggingface\$cacheName\$repositoryName\snapshots\$revision"
-    $testFile = {
-        param([string]$Path)
-        if ($null -ne $FileProbe) {
-            return [bool](& $FileProbe $Path)
-        }
-        return Test-Path -LiteralPath $Path -PathType Leaf
-    }.GetNewClosure()
-    if (-not (& $testFile (Join-Path $snapshot 'config.json')) -or
-        -not (& $testFile (Join-Path $snapshot 'vocab.json'))) {
-        return $false
-    }
-    return (& $testFile (Join-Path $snapshot 'model.safetensors')) -or
-        (& $testFile (Join-Path $snapshot 'pytorch_model.bin'))
-}
+. (Join-Path $PSScriptRoot 'Modules\Installer\Voice.ps1')
 function Test-InstallerExistingFeature {
     param(
         [Parameter(Mandatory)][pscustomobject]$Config,
@@ -9863,280 +9844,6 @@ function Read-InstallerVoiceSelection {
         -PromptKey 'Installer.Prompt.VoiceSelection' `
         -Selection $Selection `
         -DefaultEnabled ([bool]$Config.Voice.Enabled)
-}
-function Get-InstallerVoiceProfile {
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('Turkish', 'English')]
-        [string]$Language
-    )
-    if ($Language -ceq 'English') {
-        return [pscustomobject][ordered]@{
-            Language = 'en'
-            Model = 'facebook/mms-tts-eng'
-            Revision = 'c71de0fe7204c83f1c10820a7d696d0b450048ba'
-        }
-    }
-    return [pscustomobject][ordered]@{
-        Language = 'tr'
-        Model = 'facebook/mms-tts-tur'
-        Revision = '7e364479c307f06733ca865b0a5269e0209cf82d'
-    }
-}
-function Set-InstallerVoiceLanguage {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Config,
-        [Parameter(Mandatory)]
-        [ValidateSet('Turkish', 'English')]
-        [string]$Language
-    )
-    $profile = Get-InstallerVoiceProfile -Language $Language
-    $Config.Voice | Add-Member -NotePropertyName Language `
-        -NotePropertyValue $profile.Language -Force
-    $Config.Voice.Model = $profile.Model
-    $Config.Voice.Revision = $profile.Revision
-}
-function Import-InstallerExistingVoiceProfile {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Config,
-        [AllowEmptyString()][string]$InstalledConfigPath = '',
-        [scriptblock]$ConfigReader,
-        [scriptblock]$FeatureTester
-    )
-    try {
-        if ([string]::IsNullOrWhiteSpace($InstalledConfigPath)) {
-            $installedRoot = Resolve-InstallerPath `
-                -Path ([string]$Config.Paths.Root)
-            $InstalledConfigPath = Join-Path $installedRoot `
-                'Data\Configs\config.json'
-        }
-        if ($null -eq $ConfigReader -and
-            -not (Test-Path -LiteralPath $InstalledConfigPath `
-                -PathType Leaf)) {
-            return $false
-        }
-        $installedConfig = if ($null -ne $ConfigReader) {
-            & $ConfigReader -Path $InstalledConfigPath
-        }
-        else {
-            Read-JsonFile -Path $InstalledConfigPath
-        }
-        if ($null -eq $installedConfig) {
-            return $false
-        }
-        $null = Test-DeploymentConfiguration -Config $installedConfig
-        if (-not [bool]$installedConfig.Voice.Enabled) {
-            return $false
-        }
-        $language = [string]$installedConfig.Voice.Language
-        $profileName = if ($language -ceq 'en') {
-            'English'
-        }
-        elseif ($language -ceq 'tr') {
-            'Turkish'
-        }
-        else {
-            return $false
-        }
-        $profile = Get-InstallerVoiceProfile -Language $profileName
-        if ([string]$installedConfig.Voice.Model -cne $profile.Model -or
-            [string]$installedConfig.Voice.Revision -cne
-                $profile.Revision) {
-            return $false
-        }
-        $candidate = $Config | ConvertTo-Json -Depth 100 |
-            ConvertFrom-InstallerJson
-        Set-InstallerVoiceLanguage -Config $candidate `
-            -Language $profileName
-        $ready = if ($null -ne $FeatureTester) {
-            [bool](& $FeatureTester -Config $candidate)
-        }
-        else {
-            Test-InstallerExistingFeature -Config $candidate `
-                -Feature Voice -VerifyIdentity $false
-        }
-        if (-not $ready) {
-            return $false
-        }
-        Set-InstallerVoiceLanguage -Config $Config -Language $profileName
-        return $true
-    }
-    catch {
-        Write-Verbose ('Kurulu ses profili kullanilamadi: {0}' -f `
-            $_.Exception.Message)
-        return $false
-    }
-}
-function Read-InstallerVoiceLanguageSelection {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Config,
-        [ValidateSet('Prompt', 'Turkish', 'English')]
-        [string]$Selection = 'Prompt',
-        [scriptblock]$InputReader
-    )
-    if ($Selection -ne 'Prompt') {
-        Set-InstallerVoiceLanguage -Config $Config `
-            -Language $Selection
-        return $Selection
-    }
-    if (-not [Environment]::UserInteractive) {
-        $configured = if (
-            [string]$Config.Voice.Language -ceq 'en'
-        ) {
-            'English'
-        }
-        else {
-            'Turkish'
-        }
-        Set-InstallerVoiceLanguage -Config $Config `
-            -Language $configured
-        return $configured
-    }
-    Write-InstallerSection `
-        -Title 'Installer.Section.VoiceLanguageSelection'
-    Write-InstallerLine -Text (Get-LocalizedText `
-        -Key 'Installer.Voice.LanguageDescription') -Color White
-    Write-InstallerLine -Text (Get-LocalizedText `
-        -Key 'Installer.Voice.EnglishLicense') -Color Yellow
-    Write-InstallerLine -Text (Get-LocalizedText `
-        -Key 'Installer.Prompt.VoiceLanguageSelection') -Color Cyan
-    Write-InstallerRule
-    while ($true) {
-        $answer = Read-WinlamaUIInput `
-            -Prompt (Get-LocalizedText `
-                -Key 'Installer.Prompt.VoiceLanguageSelection') `
-            -Label (Get-LocalizedText `
-                -Key 'Common.Prompt.Selection') -NoLeadingRule `
-            -InputReader $InputReader
-        $resolved = switch ($answer) {
-            '1' { 'Turkish' }
-            '2' { 'English' }
-            '0' { 'Exit' }
-            default { '' }
-        }
-        if ($resolved -ceq 'Exit') {
-            return $resolved
-        }
-        if (-not [string]::IsNullOrWhiteSpace($resolved)) {
-            Set-InstallerVoiceLanguage -Config $Config `
-                -Language $resolved
-            return $resolved
-        }
-        Write-InstallerLine -Text (Get-LocalizedText `
-            -Key 'Common.Selection.Invalid') -Color Yellow
-    }
-}
-function Assert-InstallerVoiceLanguageContracts {
-    param([Parameter(Mandatory)][pscustomobject]$Config)
-    $fixture = $Config | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    $turkish = Get-InstallerVoiceProfile -Language Turkish
-    $english = Get-InstallerVoiceProfile -Language English
-    $selected = Read-InstallerVoiceLanguageSelection `
-        -Config $fixture -Selection English
-    $sourceFixture = $Config | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    Set-InstallerVoiceLanguage -Config $sourceFixture `
-        -Language Turkish
-    $profileImported = Import-InstallerExistingVoiceProfile `
-        -Config $sourceFixture -InstalledConfigPath 'C:\Fixture\config.json' `
-        -ConfigReader { param($Path) $fixture }.GetNewClosure() `
-        -FeatureTester {
-            param($Config)
-            [string]$Config.Voice.Language -ceq 'en' -and
-                [string]$Config.Voice.Model -ceq $english.Model -and
-                [string]$Config.Voice.Revision -ceq $english.Revision
-        }.GetNewClosure()
-    $invalidInstalled = $fixture | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    $invalidInstalled.Voice.Model = $turkish.Model
-    $rejectedFixture = $Config | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    Set-InstallerVoiceLanguage -Config $rejectedFixture `
-        -Language Turkish
-    $invalidImported = Import-InstallerExistingVoiceProfile `
-        -Config $rejectedFixture `
-        -InstalledConfigPath 'C:\Fixture\invalid.json' `
-        -ConfigReader { param($Path) $invalidInstalled }.GetNewClosure() `
-        -FeatureTester { throw 'Gecersiz profil probe edildi.' }
-    $disabledInstalled = $fixture | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    $disabledInstalled.Voice.Enabled = $false
-    $disabledFixture = $Config | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    Set-InstallerVoiceLanguage -Config $disabledFixture `
-        -Language Turkish
-    $disabledImported = Import-InstallerExistingVoiceProfile `
-        -Config $disabledFixture `
-        -InstalledConfigPath 'C:\Fixture\disabled.json' `
-        -ConfigReader { param($Path) $disabledInstalled }.GetNewClosure() `
-        -FeatureTester { throw 'Devre disi profil probe edildi.' }
-    $deploymentFixture = $fixture | ConvertTo-Json -Depth 100 |
-        ConvertFrom-InstallerJson
-    $deploymentRoot = Join-Path ([IO.Path]::GetTempPath()) `
-        'Winlama-Voice-Deployment-Fixture'
-    $deploymentFixture.Paths.Root = $deploymentRoot
-    $deploymentFixture.Paths.Data = 'Data'
-    $probedVoicePaths = [Collections.Generic.List[string]]::new()
-    $voiceCacheReady = Test-InstallerVoiceModelCache `
-        -Config $deploymentFixture -FileProbe {
-            param($Path)
-            $probedVoicePaths.Add([IO.Path]::GetFullPath($Path))
-            return $Path -notlike '*\pytorch_model.bin'
-        }.GetNewClosure()
-    $quickOpenWebUIReady = Test-InstallerExistingFeature `
-        -Config $deploymentFixture -Feature OpenWebUI `
-        -VerifyIdentity $false -FileProbe { return $true }
-    $quickVoiceReady = Test-InstallerExistingFeature `
-        -Config $deploymentFixture -Feature Voice `
-        -VerifyIdentity $false -FileProbe { return $true }
-    $expectedVoiceRoot = Join-Path $deploymentRoot `
-        ('Data\cache\huggingface\{0}\models--{1}\snapshots\{2}' -f `
-            $deploymentFixture.Voice.Model.Split('/')[-1],
-            $deploymentFixture.Voice.Model.Replace('/', '--'),
-            $deploymentFixture.Voice.Revision)
-    $voicePrefix = [IO.Path]::GetFullPath($expectedVoiceRoot).TrimEnd('') +
-        [IO.Path]::DirectorySeparatorChar
-    $source = (Get-Command Read-InstallerVoiceLanguageSelection `
-        -ErrorAction Stop).Definition
-    if ($turkish.Language -cne 'tr' -or
-        $turkish.Model -cne 'facebook/mms-tts-tur' -or
-        $turkish.Revision -notmatch '^[a-f0-9]{40}$' -or
-        $english.Language -cne 'en' -or
-        $english.Model -cne 'facebook/mms-tts-eng' -or
-        $english.Revision -cne
-            'c71de0fe7204c83f1c10820a7d696d0b450048ba' -or
-        $selected -cne 'English' -or
-        [string]$fixture.Voice.Language -cne 'en' -or
-        [string]$fixture.Voice.Model -cne $english.Model -or
-        [string]$fixture.Voice.Revision -cne $english.Revision -or
-        -not $profileImported -or
-        [string]$sourceFixture.Voice.Language -cne 'en' -or
-        [string]$sourceFixture.Voice.Model -cne $english.Model -or
-        [string]$sourceFixture.Voice.Revision -cne $english.Revision -or
-        $invalidImported -or
-        [string]$rejectedFixture.Voice.Language -cne 'tr' -or
-        $disabledImported -or
-        [string]$disabledFixture.Voice.Language -cne 'tr' -or
-        -not $voiceCacheReady -or -not $quickOpenWebUIReady -or
-        -not $quickVoiceReady -or $probedVoicePaths.Count -ne 3 -or
-        @($probedVoicePaths | Where-Object {
-            -not $_.StartsWith(
-                $voicePrefix,
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        }).Count -gt 0 -or
-        $source -notmatch "'0'\s*\{\s*'Exit'" -or
-        $source -notmatch "default\s*\{\s*''") {
-        throw 'Ses dili secim sozlesmesi gecersiz.'
-    }
-    Write-Verbose `
-        'WINLAMA_VALIDATION_OK:Installer.VoiceLanguageSelection'
-    Write-Verbose `
-        'WINLAMA_VALIDATION_OK:Installer.VoiceDeploymentCache'
-    Write-Verbose `
-        'WINLAMA_VALIDATION_OK:Installer.FeaturePreQuestionNoProcess'
-    return $true
 }
 function Read-InstallerOptionalErrorMode {
     param(
@@ -11971,19 +11678,9 @@ function Get-InstallerPythonExecutableCandidates {
             $full = [IO.Path]::GetFullPath(
                 [Environment]::ExpandEnvironmentVariables($Path)
             )
-            if (-not [string]::IsNullOrWhiteSpace(
-                $env:LOCALAPPDATA
-            )) {
-                $aliasRoot = [IO.Path]::GetFullPath(
-                    (Join-Path $env:LOCALAPPDATA `
-                        'Microsoft\WindowsApps')
-                ).TrimEnd('\') + '\'
-                if ($full.StartsWith(
-                    $aliasRoot,
-                    [StringComparison]::OrdinalIgnoreCase
-                )) {
-                    return
-                }
+            if ($full.IndexOf('\Microsoft\WindowsApps\',
+                    [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return
             }
             if ($seen.Add($full)) {
                 $paths.Add($full)
@@ -12617,8 +12314,7 @@ function Install-ComfyUIModelPayload {
                 try {
                     Remove-Item -LiteralPath $temporary -Force `
                         -ErrorAction SilentlyContinue
-                    Invoke-WebRequest -Uri $uri.AbsoluteUri `
-                        -OutFile $temporary -UseBasicParsing `
+                    Save-WinlamaWebFile -Uri $uri -OutFile $temporary `
                         -TimeoutSec ([int]$Config.Network.
                             DownloadTimeoutSeconds)
                     $actualHash = `
@@ -13158,10 +12854,10 @@ function Invoke-InstallerChildValidations {
             if ($childExitCode -ne 0 -or
                 $errorRecords.Count -gt 0 -or
                 $failureLines.Count -gt 0) {
-                $detail = @(
-                    $errorRecords,
-                    $failureLines,
-                    $lines | Select-Object -Last 40
+                $detail = (
+                    @($errorRecords | ForEach-Object { $_.ToString() }) +
+                    $failureLines +
+                    @($lines | Select-Object -Last 40)
                 ) -join [Environment]::NewLine
                 throw (Get-LocalizedText `
                     -Key 'Installer.Error.ChildValidationFailed' `
@@ -13274,13 +12970,13 @@ function Invoke-SourceValidation {
     $operationalFiles = @(
         Assert-ApplicationSourcePayload -SourceRoot $PSScriptRoot
     )
-    if ($operationalFiles.Count -ne 36) {
+    if ($operationalFiles.Count -ne 43) {
         throw [IO.InvalidDataException]::new(
             'Canonical operasyonel payload kimligi gecersiz.'
         )
     }
     Write-Verbose `
-        'WINLAMA_VALIDATION_OK:Installer.OperationalPayload36'
+        'WINLAMA_VALIDATION_OK:Installer.OperationalPayload43'
     Assert-InstallerRuntimePackageCleanlinessContracts
     Assert-InstallerComfyUIRuntimeContracts `
         -Config $script:InstallerConfiguration
@@ -13656,14 +13352,18 @@ function Invoke-SourceValidation {
                 "Dusuk kontrastli UI rengi: $($script.FullName)"
             )
         }
-        if ($script.Extension -ieq '.ps1') {
+        $relativeScriptPath = $script.FullName.Substring(
+            $PSScriptRoot.Length
+        ).TrimStart('\')
+        if ($relativeScriptPath -ceq 'Engine.ps1' -or
+            $configResolverNames.ContainsKey($relativeScriptPath)) {
             if ($scriptContent -notmatch '(?i)\[CmdletBinding\(' -and
                 $scriptContent -notmatch '(?i)\[CmdletBinding\(\)\]') {
                 throw (Get-LocalizedText `
                     -Key 'Installer.Error.CmdletBindingMissing' `
                     -Arguments @($script.FullName))
             }
-            if ($scriptContent -notmatch `
+            if ($scriptContent -cnotmatch `
                     'WINLAMA_UI_OK:[A-Za-z]+\.BootstrapExactExit' -or
                 $scriptContent -notmatch "'ISLEM OZETI'") {
                 throw [IO.InvalidDataException]::new(
@@ -13683,9 +13383,6 @@ function Invoke-SourceValidation {
                 )
             }
         }
-        $relativeScriptPath = $script.FullName.Substring(
-            $PSScriptRoot.Length
-        ).TrimStart('\')
         if ($configResolverNames.ContainsKey($relativeScriptPath)) {
             $resolverName = $configResolverNames[
                 $relativeScriptPath
@@ -14710,6 +14407,7 @@ function Install-PowerShellBootstrap {
         )
     )
     $downloaded = $false
+    $ProgressPreference = 'SilentlyContinue'
     Write-InstallerLog -Level INFO `
         -Message 'Installer.PowerShell.DownloadingMsi'
     try {
@@ -15226,6 +14924,8 @@ function Assert-InstallerPowerShellHandoffContracts {
             'Complete-InstallerPowerShellHandoff'
         ) -or
         (Get-LocalizedText -Key 'Installer.Unattended.Ready') -notmatch
+            'CIKIS' -or
+        (Get-LocalizedText -Key 'Installer.Unattended.ReadyNoPause') -match
             'CIKIS') {
         throw 'PowerShell handoff konsol devri gecersiz.'
     }
@@ -15257,6 +14957,8 @@ try {
         }
         Assert-InstallerElevationContracts
         Assert-InstallerLogSchemaContracts
+        Write-InstallerLog -Level STEP `
+            -Message 'Installer.ComfyUI.ModelPreservationVerifying'
         $null = Assert-InstallerDiagnosticPathContracts
         Import-Module (Join-Path $PSScriptRoot `
             'Modules\01_Logging.psm1') -Force -ErrorAction Stop
@@ -16535,6 +16237,10 @@ try {
                 -Config $pendingFixture `
                 -OllamaModelNames $missingFixtureNames `
                 -ComfyUIModels @($pendingFixture.ComfyUI.Catalog[0])
+        $comfyOnlyPayloadFixture = `
+            New-InstallerPendingPayloadConfiguration `
+                -Config $pendingFixture -OllamaModelNames $null `
+                -ComfyUIModels @($pendingFixture.ComfyUI.Catalog[0])
         if ($retainedModelSelection -cne 'qwen3.5:4b' -or
             $uncataloguedModelSelection -cne 'qwen3.5:4b' -or
             $resumeModelSelection -cne 'qwen3.5:4b' -or
@@ -16546,6 +16252,8 @@ try {
             [string]$pendingPayloadFixture.Models.Requested[0] -cne
                 'deepseek-coder:1.3b' -or
             @($pendingPayloadFixture.ComfyUI.Requested).Count -ne 1 -or
+            @($comfyOnlyPayloadFixture.Models.Requested).Count -ne 0 -or
+            @($comfyOnlyPayloadFixture.ComfyUI.Requested).Count -ne 1 -or
             $retainedComfyModels.Count -ne
                 @($retainedFixture.ComfyUI.Requested).Count -or
             @($retainedFixture.ComfyUI.Requested | Where-Object {
@@ -17039,7 +16747,9 @@ try {
                 Add-InstallerComfyUISelectionToCatalog `
                     -Models $comfyUIModels -Config $config
             }
-            $config.ComfyUI.Requested = @($comfyUIModels.Name)
+            $config.ComfyUI.Requested = @(
+                $comfyUIModels | ForEach-Object { $_.Name }
+            )
         }
         $comfyModelSelectionSkipped = $comfyUIModels.Count -eq 0
         $comfySourceAlreadySatisfied = $config.ComfyUI.Enabled -and
@@ -17238,8 +16948,6 @@ try {
         }
         Write-InstallerLog -Level $hashStatusLevel `
             -Message $hashStatusKey
-        Write-WinlamaUIStatus -Level $hashStatusLevel `
-            -Message (Get-LocalizedText -Key $hashStatusKey)
         $errorMode = Read-InstallerOptionalErrorMode `
             -Selection $OptionalErrorMode `
             -DefaultContinue ([bool]$config.Installation.
@@ -17255,8 +16963,13 @@ try {
         $completionBaselineConfig = $config |
             ConvertTo-Json -Depth 100 | ConvertFrom-InstallerJson
         Write-InstallerSection -Title 'Installer.Section.Unattended'
-        Write-InstallerLine -Text (Get-LocalizedText `
-            -Key 'Installer.Unattended.Ready') -Color Green
+        $readyMessage = if ($NoPause) {
+            Get-LocalizedText -Key 'Installer.Unattended.ReadyNoPause'
+        }
+        else {
+            Get-LocalizedText -Key 'Installer.Unattended.Ready'
+        }
+        Write-InstallerLine -Text $readyMessage -Color Green
         Write-InstallerRule
         $initialPowerShellHandoff = `
             Invoke-InstallerPowerShellRuntimeHandoff `
@@ -17388,7 +17101,7 @@ try {
                 $verified = Read-InstallerComfyUISource `
                     -Models $missingComfyModels -Config $config `
                     -ProjectRoot $script:InstallerPackageRoot `
-                    -RequiredNodeModelNames @($comfyUIModels.Name) `
+                    -RequiredNodeModelNames @($config.ComfyUI.Requested) `
                     -Selection $selection -HashCache $comfyHashCache `
                     -VerifyLocalIdentity $verifyLocalPayloadHashes `
                     -AvailabilityResult ([ref]$availability)
@@ -17408,18 +17121,12 @@ try {
         Write-InstallerLog -Level INFO -Message $verificationStartKey
         Invoke-InstallerDeferredSourceVerification `
             -Verifiers $sourceVerifiers.ToArray()
-        $pendingOllamaModelNames = if ($installOllama) {
-            @($exactModelState.Missing)
-        }
-        else {
-            @()
-        }
-        $pendingComfyUIModels = if ($config.ComfyUI.Enabled) {
-            @($exactComfyState.Missing)
-        }
-        else {
-            @()
-        }
+        $pendingOllamaModelNames = @(
+            if ($installOllama) { $exactModelState.Missing }
+        )
+        $pendingComfyUIModels = @(
+            if ($config.ComfyUI.Enabled) { $exactComfyState.Missing }
+        )
         $verifiedComfyAvailability = $exactComfyState.Availability
         $identityConfig = New-InstallerPendingPayloadConfiguration `
             -Config $config `
@@ -17502,6 +17209,11 @@ try {
         $ConfigPath = Save-EffectiveInstallerConfig -Config $config
     }
     else {
+        Set-InstallerOptionalComponents -Config $config `
+            -InstallOpenWebUI ([bool]$config.OpenWebUI.Enabled) `
+            -InstallVoice ([bool]$config.Voice.Enabled)
+        $ollamaDependency = Get-InstallerOllamaDependency -Config $config
+        $ollamaDependency.Required = [bool]$config.Ollama.Enabled
         $resumePowerShellHandoff = `
             Invoke-InstallerPowerShellRuntimeHandoff `
                 -Config $config -Reason Resume
@@ -17529,7 +17241,6 @@ try {
             throw 'Resume kurulum kaynaklari yapilandirilamadi.'
         }
         $hardware = Get-InstallerHardwareProfile -Config $config
-        $ollamaDependency = Get-InstallerOllamaDependency -Config $config
         if ($config.Ollama.Enabled) {
             Write-InstallerLog -Level INFO `
                 -Message 'Installer.SourceVerification.Ollama'
@@ -17680,7 +17391,7 @@ try {
             $resolvedComfySource = Read-InstallerComfyUISource `
                 -Models $resumePendingComfyModels -Config $config `
                 -ProjectRoot $script:InstallerPackageRoot `
-                -RequiredNodeModelNames @($requestedModels.Name) `
+                -RequiredNodeModelNames $resumeRequestedNames `
                 -Selection $resumeSourceSelection `
                 -VerifyLocalIdentity $verifyLocalPayloadHashes `
                 -HashCache $comfyHashCache `

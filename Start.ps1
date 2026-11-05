@@ -4,13 +4,13 @@ param(
     [ValidateSet('Keep', 'Restart', 'Skip')]
     [string]$OllamaMode = 'Keep',
     [ValidateSet('Keep', 'Restart', 'Skip')]
-    [string]$OpenWebUIMode = 'Restart',
+    [string]$OpenWebUIMode = 'Keep',
     [ValidateSet('Keep', 'Restart', 'Skip')]
-    [string]$VoiceMode = 'Restart',
+    [string]$VoiceMode = 'Keep',
     [ValidateSet('Keep', 'Restart', 'Skip')]
-    [string]$ComfyUIMode = 'Restart',
+    [string]$ComfyUIMode = 'Keep',
     [switch]$NoSupervise,
-    [switch]$ValidateOnly,
+    [Alias('Preview')][switch]$ValidateOnly,
     [switch]$NoPause
 )
 Set-StrictMode -Version Latest
@@ -504,6 +504,12 @@ function Start-WithRequiredPowerShell {
     if (-not (Test-Path -LiteralPath $pwsh -PathType Leaf)) {
         throw 'PowerShell 7.6 veya daha yenisi bulunamadi.'
     }
+    $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($pwsh)
+    if ([version]::new($versionInfo.ProductMajorPart,
+        $versionInfo.ProductMinorPart, $versionInfo.ProductBuildPart) -lt
+        [version]'7.6') {
+        throw 'PowerShell 7.6 veya daha yenisi bulunamadi.'
+    }
     $arguments = @(
         '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', (ConvertTo-StartupCommandLineArgument `
@@ -526,8 +532,16 @@ function Start-WithRequiredPowerShell {
     }
     $process = Start-Process -FilePath $pwsh `
         -ArgumentList $arguments -WorkingDirectory $projectRoot `
-        -NoNewWindow -Wait -PassThru
-    exit $process.ExitCode
+        -NoNewWindow -PassThru
+    try {
+        [void]$process.Handle
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
+    exit $exitCode
 }
 function Initialize-StartupLocalization {
     param([Parameter(Mandatory)][string]$ResolvedConfigPath)
@@ -556,127 +570,6 @@ $context = $null
 $initialReady = $null
 $effectiveModes = $null
 $supervisionEnabled = $false
-function Get-EffectiveStartupMode {
-    param(
-        [Parameter(Mandatory)][bool]$Enabled,
-        [Parameter(Mandatory)]
-        [ValidateSet('Keep', 'Restart', 'Skip')]
-        [string]$RequestedMode
-    )
-    if (-not $Enabled) {
-        return 'Skip'
-    }
-    return $RequestedMode
-}
-function New-EffectiveStartupModes {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Config,
-        [Parameter(Mandatory)]
-        [ValidateSet('Keep', 'Restart', 'Skip')]
-        [string]$RequestedOllamaMode,
-        [Parameter(Mandatory)]
-        [ValidateSet('Keep', 'Restart', 'Skip')]
-        [string]$RequestedOpenWebUIMode,
-        [Parameter(Mandatory)]
-        [ValidateSet('Keep', 'Restart', 'Skip')]
-        [string]$RequestedVoiceMode,
-        [Parameter(Mandatory)]
-        [ValidateSet('Keep', 'Restart', 'Skip')]
-        [string]$RequestedComfyUIMode
-    )
-    return [pscustomobject][ordered]@{
-        Ollama = Get-EffectiveStartupMode `
-            -Enabled ([bool]$Config.Ollama.Enabled) `
-            -RequestedMode $RequestedOllamaMode
-        OpenWebUI = Get-EffectiveStartupMode `
-            -Enabled ([bool]$Config.OpenWebUI.Enabled) `
-            -RequestedMode $RequestedOpenWebUIMode
-        Voice = Get-EffectiveStartupMode `
-            -Enabled ([bool]$Config.Voice.Enabled) `
-            -RequestedMode $RequestedVoiceMode
-        ComfyUI = Get-EffectiveStartupMode `
-            -Enabled ([bool]$Config.ComfyUI.Enabled) `
-            -RequestedMode $RequestedComfyUIMode
-    }
-}
-function Get-StartupActiveComponents {
-    param([Parameter(Mandatory)][pscustomobject]$Modes)
-    $components = [Collections.Generic.List[string]]::new()
-    foreach ($name in @('Ollama', 'OpenWebUI', 'Voice', 'ComfyUI')) {
-        if ([string]$Modes.$name -ne 'Skip') {
-            $components.Add($name)
-        }
-    }
-    return @($components)
-}
-function Get-StartupReadyState {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$RuntimeContext,
-        [Parameter(Mandatory)][pscustomobject]$Modes,
-        [scriptblock]$ProbeInvoker = {
-            param([string]$Name, [pscustomobject]$Context)
-            switch ($Name) {
-                'Ollama' {
-                    return Test-OllamaApiReady -Context $Context
-                }
-                'OpenWebUI' {
-                    return Test-OpenWebUIReady -Context $Context
-                }
-                'Voice' {
-                    return Test-WinlamaTtsReady -Context $Context
-                }
-                'ComfyUI' {
-                    return Test-ComfyUIReady -Context $Context
-                }
-            }
-            throw "Bilinmeyen servis saglik hedefi: $Name"
-        }
-    )
-    $ready = [ordered]@{
-        Ollama = $false
-        OpenWebUI = $false
-        Voice = $false
-        ComfyUI = $false
-    }
-    foreach ($name in @(Get-StartupActiveComponents -Modes $Modes)) {
-        $ready[$name] = [bool](& $ProbeInvoker $name $RuntimeContext)
-    }
-    return [pscustomobject]$ready
-}
-function Get-StartupEndpointComponents {
-    param(
-        [Parameter(Mandatory)][pscustomobject]$Modes,
-        [Parameter(Mandatory)][pscustomobject]$ReadyState
-    )
-    $components = [Collections.Generic.List[string]]::new()
-    foreach ($name in @(Get-StartupActiveComponents -Modes $Modes)) {
-        if ([bool]$ReadyState.$name) {
-            $components.Add($name)
-        }
-    }
-    return @($components)
-}
-function Get-StartupRecoveryModes {
-    param([Parameter(Mandatory)][pscustomobject]$Modes)
-    $recovery = [ordered]@{}
-    foreach ($name in @('Ollama', 'OpenWebUI', 'Voice', 'ComfyUI')) {
-        $recovery[$name] = if ([string]$Modes.$name -eq 'Skip') {
-            'Skip'
-        }
-        else {
-            'Keep'
-        }
-    }
-    return [pscustomobject]$recovery
-}
-function Test-StartupSupervisionEnabled {
-    param(
-        [Parameter(Mandatory)][bool]$Disabled,
-        [Parameter(Mandatory)][pscustomobject]$Modes
-    )
-    return -not $Disabled -and
-        @(Get-StartupActiveComponents -Modes $Modes).Count -gt 0
-}
 function Assert-StartupEffectiveModeContracts {
     $defaults = @{
         RequestedOllamaMode = 'Keep'
@@ -830,6 +723,7 @@ function Stop-OwnedRuntime {
         )
 }
 try {
+    . (Join-Path $projectRoot 'Modules\Startup\Controller.ps1')
     $ConfigPath = Resolve-WinlamaConfigPath -Path $ConfigPath
     if ($ValidateOnly) {
         Initialize-StartupLocalization `
@@ -853,7 +747,8 @@ try {
             'Modules\07_Ollama.psm1',
             'Modules\09_WebUI.psm1',
             'Modules\10_Runtime.psm1'
-            'Modules\UI\ConsoleUI.psm1'
+            'Modules\UI\ConsoleUI.psm1',
+            'Modules\Startup\Controller.ps1'
         )) {
             $path = Join-Path $projectRoot $relativePath
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -960,46 +855,21 @@ try {
     $context = New-DeploymentContext -Config $config `
         -PackageRoot $projectRoot
     Initialize-DeploymentDirectories -Context $context
-    Initialize-Logging -Context $context
     if ($supervisionEnabled) {
         $controllerPath = Join-Path $context.DataPath `
             'runtime-controller.json'
-        if (Test-Path -LiteralPath $controllerPath -PathType Leaf) {
-            try {
-                $existing = Read-JsonFile -Path $controllerPath
-                $process = Get-Process -Id ([int]$existing.ProcessId) `
-                    -ErrorAction SilentlyContinue
-                $sameScript = [string]$existing.ScriptPath -ieq `
-                    [IO.Path]::GetFullPath($PSCommandPath)
-                $sameStart = $null -ne $process -and
-                    $process.StartTime.ToUniversalTime().ToString('O') -eq
-                        [string]$existing.ProcessStartTimeUtc
-                if ($null -ne $process -and $process.Id -ne $PID -and
-                    $sameScript -and $sameStart) {
-                    Stop-Process -Id $process.Id -Force `
-                        -ErrorAction Stop
-                    $process.WaitForExit(10000)
-                }
-            }
-            catch {
-                Write-WinlamaUIStatus -Level WARN -Message (
-                    Get-LocalizedText `
-                        -Key 'Startup.Warning.ControllerStopFailed' `
-                        -Arguments @($_.Exception.Message)
-                )
-            }
+        $replace = $activeComponents | Where-Object {
+            $effectiveModes.$_ -eq 'Restart'
         }
-        $currentProcess = Get-Process -Id $PID
-        Write-AtomicTextFile -Path $controllerPath `
-            -Content (ConvertTo-StableJson -Depth 5 -Value `
-                ([pscustomobject]@{
-                    ProcessId = $PID
-                    ProcessStartTimeUtc = $currentProcess.StartTime.
-                        ToUniversalTime().ToString('O')
-                    ScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
-                }))
-        $currentProcess.Dispose()
+        if (-not (Register-WinlamaRuntimeController -Path $controllerPath `
+            -ScriptPath $PSCommandPath -Replace:([bool]$replace))) {
+            Write-WinlamaUIStatus -Level INFO -Message (
+                Get-LocalizedText -Key 'Startup.Operation.AlreadyRunning'
+            )
+            exit 0
+        }
     }
+    Initialize-Logging -Context $context
     $initialReady = Get-StartupReadyState -RuntimeContext $context `
         -Modes $effectiveModes
     try {
@@ -1175,8 +1045,8 @@ catch {
             )
         }
     }
-    Write-WinlamaUIError -Context (Get-LocalizedText `
-        -Key 'Startup.Error.StartFailed') `
+    Write-WinlamaUIError -Context (Get-WinlamaUIString `
+        -Key 'Startup.Error.StartFailed' -Fallback 'Winlama baslatilamadi.') `
         -ErrorRecord $failure
     if (-not $NoPause) {
         try {

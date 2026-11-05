@@ -70,7 +70,7 @@ function Get-ExpectedWinlamaPythonRoot {
     }
     $localAppData = [IO.Path]::GetFullPath($env:LOCALAPPDATA).
         TrimEnd('\')
-    if ($localAppData -notmatch '^[A-Za-z]:\\') {
+    if ($localAppData -cnotmatch '^[A-Za-z]:\\') {
         throw (New-NonRetryableException -Message `
             "Python hedefi yerel bir surucude degil: $localAppData")
     }
@@ -479,17 +479,9 @@ function Add-PythonExecutableCandidate {
             $Path.Trim().Trim('"')
         )
         $fullPath = [IO.Path]::GetFullPath($expanded)
-        if ($Source -ceq 'GetCommand' -and
-            -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-            $aliasRoot = [IO.Path]::GetFullPath(
-                (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps')
-            ).TrimEnd('\') + '\'
-            if ($fullPath.StartsWith(
-                    $aliasRoot,
-                    [StringComparison]::OrdinalIgnoreCase
-                )) {
-                return
-            }
+        if ($fullPath.IndexOf('\Microsoft\WindowsApps\',
+                [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return
         }
         if (-not $Seen.Add($fullPath)) {
             return
@@ -793,9 +785,10 @@ function Get-DependencyVersion {
         return $null
     }
     $arguments = @('--version')
+    $timeoutSeconds = if ($Dependency.Command -ceq 'ollama.exe') { 90 } else { 30 }
     try {
         $result = Invoke-ExternalProcess -FilePath $executable `
-            -ArgumentList $arguments -TimeoutSeconds 30
+            -ArgumentList $arguments -TimeoutSeconds $timeoutSeconds
         $text = "$($result.StandardOutput) $($result.StandardError)"
         return Get-VersionFromText -Text $text
     }
@@ -818,7 +811,7 @@ function Test-OllamaApplicationExecutable {
     }
     return Test-Path -LiteralPath $applicationPath -PathType Leaf
 }
-function Test-Dependency {
+function Get-VerifiedDependencyVersion {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -833,16 +826,13 @@ function Test-Dependency {
         if ($null -eq $ollamaExecutable -or
             -not (Test-OllamaApplicationExecutable `
                 -ExecutablePath $ollamaExecutable)) {
-            return $false
+            return $null
         }
     }
     $version = Get-DependencyVersion -Dependency $Dependency `
         -Context $Context -ExecutablePath $ollamaExecutable
-    if ($null -eq $version) {
-        return $false
-    }
-    if ($version -lt [version]$Dependency.MinimumVersion) {
-        return $false
+    if ($null -eq $version -or $version -lt [version]$Dependency.MinimumVersion) {
+        return $null
     }
     $maximumProperty = $Dependency.PSObject.Properties[
         'MaximumVersionExclusive'
@@ -850,9 +840,20 @@ function Test-Dependency {
     if ($null -ne $maximumProperty -and
         -not [string]::IsNullOrWhiteSpace($maximumProperty.Value) -and
         $version -ge [version]$maximumProperty.Value) {
-        return $false
+        return $null
     }
-    return $true
+    return $version
+}
+function Test-Dependency {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Dependency,
+        [AllowNull()]
+        [pscustomobject]$Context
+    )
+    return $null -ne (Get-VerifiedDependencyVersion `
+        -Dependency $Dependency -Context $Context)
 }
 function Install-DependencyWithWinget {
     [CmdletBinding()]
@@ -935,7 +936,7 @@ function Install-DependencyFromOfflineArtifact {
     }
     $result = Invoke-ExternalProcess -FilePath $path `
         -ArgumentList $arguments `
-        -TimeoutSeconds $Context.Config.Network.DownloadTimeoutSeconds `
+        -TimeoutSeconds $Context.Config.Network.OperationTimeoutSeconds `
         -AllowedExitCodes $allowedExitCodes
     if ($null -ne $pythonPlan) {
         $result | Add-Member -NotePropertyName InstallerLogPath `
@@ -1201,7 +1202,7 @@ function Assert-DependencyOwnershipContracts {
                 )
             }.GetNewClosure()
     )
-    $dependencyProbe = (Get-Command Test-Dependency `
+    $dependencyProbe = (Get-Command Get-VerifiedDependencyVersion `
         -ErrorAction Stop).Definition
     $resolverProbe = (Get-Command Get-DependencyExecutable `
         -ErrorAction Stop).Definition
@@ -1746,6 +1747,7 @@ function Install-PlatformDependencies {
         }
         $installed = $false
         $installerSucceeded = $false
+        $verifiedVersion = $null
         $ownershipSource = ''
         $installSource = if ($null -ne $dependency.PSObject.Properties[
             'InstallSource'
@@ -1785,8 +1787,9 @@ function Install-PlatformDependencies {
                     'LocalArtifact'
                 }
                 Sync-SystemEnvironment -Context $Context
-                $installed = Test-Dependency -Dependency $dependency `
-                    -Context $Context
+                $verifiedVersion = Get-VerifiedDependencyVersion `
+                    -Dependency $dependency -Context $Context
+                $installed = $null -ne $verifiedVersion
                 if (-not $installed) {
                     $message = Get-LocalizedText `
                         -Key 'Dependencies.Error.VerificationFailed' `
@@ -1799,6 +1802,7 @@ function Install-PlatformDependencies {
             }
             catch {
                 $installerSucceeded = $false
+                $verifiedVersion = $null
                 $ownershipSource = ''
                 if ($_.Exception.Data['Winlama.Retryable'] -eq $false -or
                     $installSource -eq 'Local') {
@@ -1834,11 +1838,11 @@ function Install-PlatformDependencies {
                     -WingetPath $winget `
                     -Dependency $dependency -Context $Context
                 Sync-SystemEnvironment -Context $Context
-                $dependencyVerified = Test-Dependency `
+                $verifiedVersion = Get-VerifiedDependencyVersion `
                     -Dependency $dependency -Context $Context
                 $installerSucceeded = Test-WingetInstallVerified `
                     -ExitCode $installResult.ExitCode `
-                    -DependencyVerified $dependencyVerified
+                    -DependencyVerified ($null -ne $verifiedVersion)
                 $installed = $installerSucceeded
                 if (-not $installed) {
                     throw (Get-LocalizedText `
@@ -1849,6 +1853,7 @@ function Install-PlatformDependencies {
             }
             catch {
                 $installerSucceeded = $false
+                $verifiedVersion = $null
                 $ownershipSource = ''
                 Write-DeploymentLog -Context $Context -Level WARN `
                     -Module DEPENDENCIES `
@@ -1888,8 +1893,11 @@ function Install-PlatformDependencies {
             }
         }
         else {
-            $dependencyVerified = Test-Dependency `
-                -Dependency $dependency -Context $Context
+            if ($null -eq $verifiedVersion) {
+                $verifiedVersion = Get-VerifiedDependencyVersion `
+                    -Dependency $dependency -Context $Context
+            }
+            $dependencyVerified = $null -ne $verifiedVersion
         }
         if (-not $dependencyVerified) {
             $message = Get-LocalizedText `
@@ -1914,8 +1922,7 @@ function Install-PlatformDependencies {
             $pythonResolution.Version
         }
         else {
-            Get-DependencyVersion -Dependency $dependency `
-                -Context $Context
+            $verifiedVersion
         }
         Write-DeploymentLog -Context $Context -Level INFO `
             -Module DEPENDENCIES `

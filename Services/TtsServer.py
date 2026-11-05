@@ -18,6 +18,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from transformers import AutoTokenizer, VitsModel
 DEFAULT_MODEL = "facebook/mms-tts-tur"
 DEFAULT_LANGUAGE = "tr"
+VOICE_PROFILES = {
+    "tr": ("facebook/mms-tts-tur", "7e364479c307f06733ca865b0a5269e0209cf82d"),
+    "en": ("facebook/mms-tts-eng", "c71de0fe7204c83f1c10820a7d696d0b450048ba"),
+}
 MESSAGE_KEYS = (
     "Tts.Api.InternalError",
     "Tts.Api.MethodNotAllowed",
@@ -79,22 +83,23 @@ class SpeechRequest(BaseModel):
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
 logger = logging.getLogger("winlama.tts")
 model_lock = threading.Lock()
-model_state = {
-    "device": None,
-    "model": None,
-    "model_id": None,
-    "revision": None,
-    "tokenizer": None,
-}
-def get_model(model_id: str):
+model_state = {}
+def configured_profiles():
+    language = get_configured_language()
+    primary = (get_configured_model(), os.environ.get("WINLAMA_TTS_REVISION") or None)
+    profiles = {language: primary}
+    if os.environ.get("WINLAMA_TTS_BILINGUAL") == "1":
+        additional = "en" if language == "tr" else "tr"
+        profiles[additional] = VOICE_PROFILES[additional]
+    return profiles
+def get_model(model_id: str, revision: str | None):
     with model_lock:
-        revision = os.environ.get("WINLAMA_TTS_REVISION") or None
-        if (
-            model_state["model_id"] == model_id
-            and model_state["revision"] == revision
-        ):
-            return model_state
+        key = (model_id, revision)
+        if key in model_state:
+            return model_state[key]
         cache_dir = os.environ.get("WINLAMA_TTS_CACHE") or None
+        if cache_dir and model_id != get_configured_model():
+            cache_dir = os.path.join(os.path.dirname(cache_dir), model_id.split("/")[-1])
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
             cache_dir=cache_dir,
@@ -108,19 +113,13 @@ def get_model(model_id: str):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
         model.eval()
-        model_state.update(
-            device=device,
-            model=model,
-            model_id=model_id,
-            revision=revision,
-            tokenizer=tokenizer,
-        )
-        return model_state
+        state = {"device": device, "model": model, "tokenizer": tokenizer}
+        model_state[key] = state
+        return state
 @asynccontextmanager
 async def lifespan(_):
-    model_id = get_configured_model()
-    get_configured_language()
-    await asyncio.to_thread(get_model, model_id)
+    for profile in configured_profiles().values():
+        await asyncio.to_thread(get_model, *profile)
     yield
 app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 @app.exception_handler(RequestValidationError)
@@ -160,53 +159,63 @@ async def unexpected_error(_, exception):
     )
 @app.get("/health")
 def health():
-    expected_model = get_configured_model()
-    if model_state["model_id"] != expected_model:
+    profiles = configured_profiles()
+    language = get_configured_language()
+    model, revision = profiles[language]
+    if not all(profile in model_state for profile in profiles.values()):
         raise HTTPException(
             status_code=503,
             detail=get_message("Tts.Error.ModelNotReady"),
         )
     return {
-        "model": model_state["model_id"],
-        "language": get_configured_language(),
+        "model": model,
+        "language": language,
         "ready": True,
-        "revision": model_state["revision"],
+        "revision": revision,
+        "voices": list(profiles),
     }
 @app.get("/v1/models")
 def models():
-    model_id = get_configured_model()
-    entries = [{"id": model_id, "name": model_id, "object": "model"}]
+    entries = [
+        {"id": model_id, "name": model_id, "object": "model"}
+        for model_id, _ in configured_profiles().values()
+    ]
     return {"data": entries, "models": entries}
 @app.get("/v1/audio/models")
 def audio_models():
     return models()
 @app.get("/v1/audio/voices")
 def voices():
-    language = get_configured_language()
-    names = {
-        "en": get_message("Tts.Voice.en"),
-        "tr": get_message("Tts.Voice.tr"),
-    }
-    entries = [{"id": language, "name": names[language]}]
+    entries = [
+        {"id": language, "name": get_message(f"Tts.Voice.{language}")}
+        for language in configured_profiles()
+    ]
     return {"data": entries, "voices": entries}
 @app.post("/v1/audio/speech")
 def speech(request: SpeechRequest):
-    allowed_model = get_configured_model()
-    allowed_language = get_configured_language()
-    requested_model = request.model or allowed_model
-    requested_voice = request.voice or allowed_language
-    if requested_model != allowed_model:
+    profiles = configured_profiles()
+    default_language = get_configured_language()
+    language_for_model = {
+        model_id: language for language, (model_id, _) in profiles.items()
+    }
+    if request.model and request.model not in language_for_model:
         raise HTTPException(
             status_code=400,
             detail=get_message("Tts.Error.ModelUnsupported"),
         )
-    if requested_voice != allowed_language:
+    language = request.voice or language_for_model.get(request.model, default_language)
+    if language not in profiles:
         raise HTTPException(
             status_code=400,
             detail=get_message("Tts.Error.VoiceUnsupported"),
         )
+    if request.model and request.model not in {profiles[language][0], profiles[default_language][0]}:
+        raise HTTPException(
+            status_code=400,
+            detail=get_message("Tts.Error.ModelUnsupported"),
+        )
     try:
-        state = get_model(allowed_model)
+        state = get_model(*profiles[language])
         inputs = state["tokenizer"](
             request.input,
             return_tensors="pt",
